@@ -1,0 +1,12 @@
+struct Point {
+    int x;
+    int y;
+};
+int main() {
+    int x = 100 + 25;
+    int y = x + 10;
+    Point p;
+    p.x = x;
+    p.y = y;
+    return x;
+}
