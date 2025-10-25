@@ -28,11 +28,34 @@ public class Project2ErrorListener extends BaseErrorListener {
         int errorLine = line - 1;
         if (recognizer instanceof Parser) {
             Parser parser = (Parser) recognizer;
-            // 期望的第一个符号类型
+            // 期望的符号集合
             IntervalSet expected = parser.getExpectedTokens();
-            int type = expected.getMinElement();
-            String name = parser.getVocabulary().getSymbolicName(type);
-            if (name != null) symbolName = name;
+            int[] elems = expected.toArray();
+            if (elems.length > 0) {
+                // 优先选出右大括号等对结构影响较大的符号（当缺失 '}' 时更直观）
+                for (int t : elems) {
+                    String n = parser.getVocabulary().getSymbolicName(t);
+                    if ("RBRACE".equals(n) || "SEMI".equals(n) || "RPAREN".equals(n)) {
+                        symbolName = n;
+                        break;
+                    }
+                }
+                // 如果上面没有选出优先符号，则选择第一个有名称且不是 EOF 的符号
+                if ("UNKNOWN".equals(symbolName)) {
+                    for (int t : elems) {
+                        String n = parser.getVocabulary().getSymbolicName(t);
+                        if (n != null && !"EOF".equals(n)) {
+                            symbolName = n;
+                            break;
+                        }
+                    }
+                }
+                // 最后兜底：使用 vocabulary 的 display name
+                if ("UNKNOWN".equals(symbolName)) {
+                    int t = elems[0];
+                    symbolName = parser.getVocabulary().getDisplayName(t);
+                }
+            }
             // 取前一个有效 token 的行号
             if (offendingSymbol instanceof Token) {
                 Token tok = (Token) offendingSymbol;
