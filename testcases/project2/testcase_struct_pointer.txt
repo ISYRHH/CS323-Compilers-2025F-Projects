@@ -1,0 +1,38 @@
+Parse Tree:
+(program
+  (globalDef
+    (specifier
+      struct sign { 
+      (specifier int)
+      (varDec a) ; 
+      (specifier char)
+      (varDec b) ; } 
+    ) ; 
+  )
+  (globalDef
+    (specifier struct sign)
+    (varDec
+      * 
+      (varDec
+        (varDec
+          ( 
+          (varDec
+            * 
+            (varDec
+              (varDec var) [ 5 ] 
+            )
+          ) ) 
+        ) [ 10 ] 
+      )
+    ) ; 
+  )
+  (globalDef
+    (specifier int) main ( funcArgs ) { 
+    (statement
+      return 
+      (expression 0) ; 
+    ) } 
+  ) <EOF> 
+)
+
+constexpr:

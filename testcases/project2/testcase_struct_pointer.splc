@@ -1,0 +1,6 @@
+struct sign { int a; char b; };
+struct sign *(*var[5])[10];
+
+int main() {
+    return 0;
+}

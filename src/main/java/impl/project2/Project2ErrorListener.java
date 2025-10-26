@@ -56,6 +56,97 @@ public class Project2ErrorListener extends BaseErrorListener {
                     symbolName = parser.getVocabulary().getDisplayName(t);
                 }
             }
+            // 如果假设每个错误只缺少一个符号，那么一种常见情况是缺少右大括号 '}'。
+            // 我们对 offendingSymbol 之前的 token 流做一次简单计数：若 LBRACE 比 RBRACE 多，
+            // 则很可能是缺少一个 RBRACE，优先返回 RBRACE。这比盲目选第一个期望符号更可靠。
+            try {
+                if (offendingSymbol instanceof Token) {
+                    Token tok = (Token) offendingSymbol;
+                    org.antlr.v4.runtime.TokenStream stream = (org.antlr.v4.runtime.TokenStream) parser.getInputStream();
+                    int upto = tok.getTokenIndex();
+                    // 用栈记录未匹配的左大括号位置，以便找到最后一个未闭合的 LBRACE 的索引
+                    java.util.ArrayDeque<Integer> lbraceStack = new java.util.ArrayDeque<>();
+                    for (int i = 0; i < upto; i++) {
+                        Token t = stream.get(i);
+                        String tn = parser.getVocabulary().getSymbolicName(t.getType());
+                        if ("LBRACE".equals(tn)) {
+                            lbraceStack.addLast(i);
+                        } else if ("RBRACE".equals(tn)) {
+                            if (!lbraceStack.isEmpty()) lbraceStack.removeLast();
+                        }
+                    }
+                    if (!lbraceStack.isEmpty()) {
+                        int braceDelta = lbraceStack.size();
+                        int lastUnmatched = lbraceStack.getLast();
+                        if (braceDelta > 0) {
+                            // 保守策略：仅当 parser 的期望集合中也包含 RBRACE 时，才把缺失符号判为 RBRACE。
+                            boolean expectedHasRbrace = false;
+                            try {
+                                int[] expectedElems = expected.toArray();
+                                for (int tt : expectedElems) {
+                                    String name = parser.getVocabulary().getSymbolicName(tt);
+                                    if ("RBRACE".equals(name)) {
+                                        expectedHasRbrace = true;
+                                        break;
+                                    }
+                                }
+                            } catch (Exception ignored) {
+                            }
+                            if (expectedHasRbrace) {
+                                symbolName = "RBRACE";
+                                // 将缺失符号的行号设为前一个有效 token 的行号（0-based）
+                                if (upto - 1 >= 0) {
+                                    Token prev = stream.get(upto - 1);
+                                    errorLine = prev.getLine() - 1;
+                                }
+                            } else {
+                                // 更强的上下文检测：寻找在 lastUnmatched 之后的新函数定义起始位置
+                                try {
+                                    int size = stream.size();
+                                    boolean foundFuncStart = false;
+                                    int funcIndex = -1;
+                                    for (int k = lastUnmatched + 1; k + 2 < size; k++) {
+                                        Token t0 = stream.get(k);
+                                        String n0 = parser.getVocabulary().getSymbolicName(t0.getType());
+                                        if ("INT".equals(n0) || "CHAR".equals(n0) || "STRUCT".equals(n0)) {
+                                            Token t1 = stream.get(k + 1);
+                                            Token t2 = stream.get(k + 2);
+                                            String n1 = parser.getVocabulary().getSymbolicName(t1.getType());
+                                            String n2 = parser.getVocabulary().getSymbolicName(t2.getType());
+                                            if ("Identifier".equals(n1) && "LPAREN".equals(n2)) {
+                                                funcIndex = k;
+                                                foundFuncStart = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (foundFuncStart) {
+                                        // ensure no RBRACE appears between lastUnmatched and funcIndex (otherwise block closed)
+                                        boolean rbraceBetween = false;
+                                        for (int k = lastUnmatched + 1; k < funcIndex; k++) {
+                                            Token tk = stream.get(k);
+                                            String nk = parser.getVocabulary().getSymbolicName(tk.getType());
+                                            if ("RBRACE".equals(nk)) {
+                                                rbraceBetween = true;
+                                                break;
+                                            }
+                                        }
+                                        if (!rbraceBetween) {
+                                            symbolName = "RBRACE";
+                                            if (upto - 1 >= 0) {
+                                                Token prev = stream.get(upto - 1);
+                                                errorLine = prev.getLine() - 1;
+                                            }
+                                        }
+                                    }
+                                } catch (Exception ignored) {
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
             // 启发式修复：如果触发错误的 token 看起来像是类型或标识符，且前一个 token 是标识符，
             // 并且当前解析上下文在 funcArgs 规则内，很可能是缺少逗号（参数间缺少逗号，如 "int x int y"）
             if (offendingSymbol instanceof Token) {
