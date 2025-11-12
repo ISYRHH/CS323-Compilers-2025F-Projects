@@ -1,1 +1,7 @@
-14:4: error: Redeclaration of 'c'
+Variables:
+a: int
+
+Functions:
+b: int()
+c: int()
+main: int(int)

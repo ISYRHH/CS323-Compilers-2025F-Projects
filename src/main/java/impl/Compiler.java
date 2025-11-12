@@ -239,15 +239,20 @@ public class Compiler extends AbstractCompiler {
                         }
                         // redeclaration/definition checks
                         if (global.containsHere(fname)) {
-                            // if earlier defined as variable -> redeclaration
-                            grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
+                            framework.lang.Type existing = global.lookup(fname);
+                            if (existing instanceof Types.FuncType) {
+                                // previously declared as function: accept declaration before definition
+                                // prefer the existing FuncType (so its parameter list is preserved)
+                                ft = (Types.FuncType) existing;
+                            } else {
+                                // declared as non-function (e.g., variable) -> redeclaration
+                                grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
+                            }
+                        } else {
+                            // register function before processing body so recursive calls work
+                            global.define(fname, ft);
+                            globalFuncs.putIfAbsent(fname, ft);
                         }
-                        // register function before processing body so recursive calls work
-                        if (global.containsHere(fname)) {
-                            grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
-                        }
-                        global.define(fname, ft);
-                        globalFuncs.putIfAbsent(fname, ft);
 
                         // create new scope for function body
                         Scope old = cur;
