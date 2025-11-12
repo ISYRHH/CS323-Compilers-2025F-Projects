@@ -11,6 +11,13 @@ import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonTokenStream;
 
 import java.io.IOException;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import generated.Splc.SplcParser.*;
+import org.antlr.v4.runtime.tree.TerminalNode;
 
 public class Compiler extends AbstractCompiler {
     public Compiler(AbstractGrader grader) {
@@ -24,34 +31,344 @@ public class Compiler extends AbstractCompiler {
         CommonTokenStream tokens = new CommonTokenStream(lexer);
         SplcParser parser = new SplcParser(tokens);
 
-        // TODO: XXX
         SplcParser.ProgramContext program = parser.program();
 
+        // global scope
+        Scope global = new Scope(null);
+        // keep insertion order for printing
+        Map<String, framework.lang.Type> globalVars = new LinkedHashMap<>();
+        Map<String, framework.lang.Type> globalFuncs = new LinkedHashMap<>();
+
+        // visitor to process program
         new SplcBaseVisitor<Void>() {
-            // These are merely examples to show how to create and report a Semantic Error.
-            // The Alternative name (ExprID, VarDecBase, etc.) used here may not be the same as yours.
-            // So it's fine that this code won't compile. You are free to delete all of these code.
+            private Scope cur = global;
+
+            private Types.PrimitiveType INT = new Types.PrimitiveType("int");
+            private Types.PrimitiveType CHAR = new Types.PrimitiveType("char");
+
+            private Types.StructType ensureTag(SplcParser.SpecifierContext spec) {
+                // spec: STRUCT Identifier [ ... ]
+                TerminalNode id = spec.Identifier();
+                String name = id.getText();
+                // tag scope begins after this appearance, but for simplicity we register it here
+                Types.StructType st = cur.lookupTag(name);
+                if (st == null) {
+                    st = new Types.StructType(name);
+                    cur.defineTag(name, st);
+                }
+                return st;
+            }
+
+            private framework.lang.Type typeFromSpecifier(SplcParser.SpecifierContext spec) {
+                if (spec.INT() != null) return INT;
+                if (spec.CHAR() != null) return CHAR;
+                if (spec.STRUCT() != null && spec.LBRACE() == null) {
+                    // struct Identifier (maybe incomplete or reference to existing tag)
+                    TerminalNode id = spec.Identifier();
+                    String tag = id.getText();
+                    Types.StructType st = cur.lookupTag(tag);
+                    if (st == null) {
+                        // declare incomplete tag in current scope
+                        st = new Types.StructType(tag);
+                        cur.defineTag(tag, st);
+                    }
+                    return st;
+                }
+                // struct Identifier { members }
+                if (spec.STRUCT() != null && spec.LBRACE() != null) {
+                    TerminalNode id = spec.Identifier();
+                    String tag = id.getText();
+                    // if tag exists and is complete in same scope -> redeclaration error
+                    Types.StructType existing = cur.lookupTag(tag);
+                    if (existing != null && existing.isComplete() && cur.hasTagHere(tag)) {
+                        grader.reportSemanticError(Project3SemanticError.redeclaration(id));
+                    }
+                    Types.StructType st = existing != null ? existing : new Types.StructType(tag);
+                    // mark visible immediately per project note
+                    cur.defineTag(tag, st);
+                    // fill members
+                    List<SpecifierContext> specs = spec.specifier();
+                    List<VarDecContext> vds = spec.varDec();
+                    for (int i = 0; i < specs.size(); i++) {
+                        SpecifierContext ms = specs.get(i);
+                        VarDecContext mv = vds.get(i);
+                        // resolve member type and name using a temporary context: use current scope for tags
+                        framework.lang.Type base = typeFromSpecifier(ms);
+                        VarDecl resolved = resolveVarDec(mv, base);
+                        // member cannot have incomplete type (except pointer)
+                        if (resolved.type instanceof Types.StructType) {
+                            Types.StructType memberStruct = (Types.StructType) resolved.type;
+                            if (!memberStruct.isComplete()) {
+                                grader.reportSemanticError(Project3SemanticError.memberIncomplete(mv.Identifier()));
+                            }
+                        }
+                        // duplicate member names not tracked across name spaces here; but check within struct
+                        st.addMember(resolved.name, resolved.type);
+                    }
+                    st.setComplete(true);
+                    return st;
+                }
+                return null;
+            }
+
+            private class VarDecl { String name; framework.lang.Type type; TerminalNode idTok; }
+
+            private VarDecl resolveVarDec(VarDecContext ctx, framework.lang.Type base) {
+                Objects.requireNonNull(ctx);
+                // recursively resolve inner varDec first
+                if (ctx.Identifier() != null) {
+                    VarDecl r = new VarDecl();
+                    r.name = ctx.Identifier().getText();
+                    r.idTok = ctx.Identifier();
+                    r.type = base;
+                    return r;
+                }
+                if (ctx.LPAREN() != null) {
+                    VarDecl inner = resolveVarDec(ctx.varDec(), base);
+                    return inner;
+                }
+                if (ctx.STAR() != null) {
+                    VarDecl inner = resolveVarDec(ctx.varDec(), base);
+                    VarDecl r = new VarDecl();
+                    r.name = inner.name; r.idTok = inner.idTok; r.type = new Types.PointerType(inner.type);
+                    return r;
+                }
+                // array or recursion case
+                if (ctx.varDec() != null) {
+                    VarDecl inner = resolveVarDec(ctx.varDec(), base);
+                    if (ctx.Number() != null) {
+                        int len = Integer.parseInt(ctx.Number().getText());
+                        VarDecl r = new VarDecl();
+                        r.name = inner.name; r.idTok = inner.idTok; r.type = new Types.ArrayType(inner.type, len);
+                        return r;
+                    }
+                    return inner;
+                }
+                throw new RuntimeException("unhandled varDec shape");
+            }
+
+            private void checkExpr(ExpressionContext e) {
+                if (e == null) return;
+                // if Identifier terminal and single child
+                if (e.Identifier() != null && e.getChildCount() == 1) {
+                    TerminalNode id = e.Identifier();
+                    String name = id.getText();
+                    if (cur.lookup(name) == null) {
+                        grader.reportSemanticError(Project3SemanticError.undeclaredUse(id));
+                    }
+                    return;
+                }
+                // function call: Identifier LPAREN ... RPAREN
+                if (e.Identifier() != null && e.getChildCount() >= 3 && e.getChild(1).getText().equals("(")) {
+                    TerminalNode id = e.Identifier();
+                    if (cur.lookup(id.getText()) == null) {
+                        grader.reportSemanticError(Project3SemanticError.undeclaredUse(id));
+                    }
+                    // check args
+                    for (int i = 2; i < e.getChildCount() - 1; i++) {
+                        if (e.getChild(i) instanceof ExpressionContext) {
+                            checkExpr((ExpressionContext) e.getChild(i));
+                        }
+                        // commas are ignored
+                    }
+                    return;
+                }
+                // recurse into children expressions
+                for (int i = 0; i < e.getChildCount(); i++) {
+                    if (e.getChild(i) instanceof ExpressionContext) {
+                        checkExpr((ExpressionContext) e.getChild(i));
+                    }
+                }
+            }
+
             @Override
-            public Void visitExprID(SplcParser.ExprIDContext ctx) {
-                var ident = ctx.Identifier();
-                grader.reportSemanticError(Project3SemanticError.undeclaredUse(ident));
+            public Void visitProgram(ProgramContext ctx) {
+                // process global definitions in order
+                for (GlobalDefContext g : ctx.globalDef()) {
+                    // function definition?
+                    if (g.LBRACE() != null && g.RBRACE() != null) {
+                        // header: specifier Identifier LPAREN funcArgs RPAREN
+                        String fname = g.Identifier().getText();
+                        framework.lang.Type rett = typeFromSpecifier(g.specifier());
+                        Types.FuncType ft = new Types.FuncType(rett);
+                        // params
+                        FuncArgsContext fa = g.funcArgs();
+                        if (fa != null && fa.specifier().size() > 0) {
+                            for (int i = 0; i < fa.specifier().size(); i++) {
+                                framework.lang.Type pt = typeFromSpecifier(fa.specifier(i));
+                                VarDecl vd = resolveVarDec(fa.varDec(i), pt);
+                                ft.addParam(vd.type);
+                            }
+                        }
+                        // redeclaration/definition checks
+                        if (global.containsHere(fname)) {
+                            // if earlier defined as variable -> redeclaration
+                            grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
+                        }
+                        // register function before processing body so recursive calls work
+                        global.define(fname, ft);
+                        globalFuncs.putIfAbsent(fname, ft);
+
+                        // create new scope for function body
+                        Scope old = cur;
+                        cur = new Scope(global);
+                        // add parameters into current scope
+                        if (fa != null && fa.specifier().size() > 0) {
+                            for (int i = 0; i < fa.specifier().size(); i++) {
+                                framework.lang.Type pt = typeFromSpecifier(fa.specifier(i));
+                                VarDecl vd = resolveVarDec(fa.varDec(i), pt);
+                                // check duplicate param names in same function prototype / params
+                                if (cur.containsHere(vd.name)) {
+                                    grader.reportSemanticError(Project3SemanticError.redefinition(vd.idTok));
+                                }
+                                cur.define(vd.name, vd.type);
+                            }
+                        }
+                        // visit statements in body
+                        for (StatementContext s : g.statement()) {
+                            visit(s);
+                        }
+                        cur = old;
+                    } else if (g.varDec() != null) {
+                        // global variable definition: specifier varDec SEMI
+                        framework.lang.Type base = typeFromSpecifier(g.specifier());
+                        VarDecl vd = resolveVarDec(g.varDec(), base);
+                        String name = vd.name;
+                        // if element type of array must be complete: check for Array at top-level
+                        if (vd.type instanceof Types.ArrayType) {
+                            Types.ArrayType at = (Types.ArrayType) vd.type;
+                            if (at.getElement() instanceof Types.StructType) {
+                                Types.StructType st = (Types.StructType) at.getElement();
+                                if (!st.isComplete()) {
+                                    grader.reportSemanticError(Project3SemanticError.definitionIncomplete(vd.idTok));
+                                }
+                            }
+                        }
+                        // redefinition checks
+                        if (global.containsHere(name)) {
+                            grader.reportSemanticError(Project3SemanticError.redefinition(vd.idTok));
+                        }
+                        // if previously a function declared? redeclaration
+                        if (global.lookup(name) != null) {
+                            grader.reportSemanticError(Project3SemanticError.redeclaration(g.varDec().Identifier()));
+                        }
+                        global.define(name, vd.type);
+                        globalVars.putIfAbsent(name, vd.type);
+                    } else {
+                        // specifier SEMI : probably struct declaration or standalone specifier
+                        SpecifierContext sc = g.specifier();
+                        if (sc.STRUCT() != null && sc.LBRACE() != null) {
+                            // full struct definition with no variable
+                            // register tag
+                            TerminalNode id = sc.Identifier();
+                            String tag = id.getText();
+                            Types.StructType existing = global.lookupTag(tag);
+                            if (existing != null && existing.isComplete() && global.hasTagHere(tag)) {
+                                grader.reportSemanticError(Project3SemanticError.redeclaration(id));
+                            }
+                            Types.StructType st = existing != null ? existing : new Types.StructType(tag);
+                            global.defineTag(tag, st);
+                            // fill members
+                            List<SpecifierContext> specs = sc.specifier();
+                            List<VarDecContext> vds = sc.varDec();
+                            for (int i = 0; i < specs.size(); i++) {
+                                framework.lang.Type base = typeFromSpecifier(specs.get(i));
+                                VarDecl mv = resolveVarDec(vds.get(i), base);
+                                if (mv.type instanceof Types.StructType) {
+                                    Types.StructType memberStruct = (Types.StructType) mv.type;
+                                    if (!memberStruct.isComplete()) {
+                                        grader.reportSemanticError(Project3SemanticError.memberIncomplete(vds.get(i).Identifier()));
+                                    }
+                                }
+                                st.addMember(mv.name, mv.type);
+                            }
+                            st.setComplete(true);
+                        } else if (sc.STRUCT() != null && sc.LBRACE() == null) {
+                            // e.g., struct Tag; declare incomplete tag
+                            TerminalNode id = sc.Identifier();
+                            String tag = id.getText();
+                            if (global.lookupTag(tag) == null) {
+                                Types.StructType st = new Types.StructType(tag);
+                                global.defineTag(tag, st);
+                            }
+                        }
+                    }
+                }
+
+                // after processing all, if no semantic error occurred, print results
+                grader.print("Variables:\n");
+                for (Map.Entry<String, framework.lang.Type> e : globalVars.entrySet()) {
+                    grader.print(e.getKey() + ": " + e.getValue().fullPrint() + "\n");
+                }
+                grader.print("\n");
+                grader.print("Functions:\n");
+                for (Map.Entry<String, framework.lang.Type> e : globalFuncs.entrySet()) {
+                    grader.print(e.getKey() + ": " + e.getValue().fullPrint() + "\n");
+                }
+
                 return null;
             }
 
             @Override
-            public Void visitVarDecBase(SplcParser.VarDecBaseContext ctx) {
-                var ident = ctx.Identifier();
-                grader.reportSemanticError(Project3SemanticError.redefinition(ident));
+            public Void visitVarDecStmt(VarDecStmtContext ctx) {
+                // local variable declaration: add to current scope and check duplicates
+                framework.lang.Type base = typeFromSpecifier(ctx.specifier());
+                VarDecl vd = resolveVarDec(ctx.varDec(), base);
+                if (cur.containsHere(vd.name)) {
+                    grader.reportSemanticError(Project3SemanticError.redefinition(vd.idTok));
+                }
+                // check incomplete type in local definition: if struct type and incomplete -> error
+                if (vd.type instanceof Types.StructType) {
+                    Types.StructType st = (Types.StructType) vd.type;
+                    if (!st.isComplete()) {
+                        grader.reportSemanticError(Project3SemanticError.definitionIncomplete(vd.idTok));
+                    }
+                }
+                cur.define(vd.name, vd.type);
+                // optional initializer
+                if (ctx.ASSIGN() != null) {
+                    checkExpr(ctx.expression());
+                }
                 return null;
             }
+
+            @Override
+            public Void visitBlockStmt(BlockStmtContext ctx) {
+                // enter new scope
+                Scope old = cur;
+                cur = new Scope(old);
+                for (StatementContext s : ctx.statement()) visit(s);
+                cur = old;
+                return null;
+            }
+
+            @Override
+            public Void visitExpressionStmt(ExpressionStmtContext ctx) {
+                checkExpr(ctx.expression());
+                return null;
+            }
+
+            @Override
+            public Void visitIfStmt(IfStmtContext ifc) {
+                checkExpr(ifc.expression());
+                visit(ifc.statement(0));
+                if (ifc.statement().size() > 1) visit(ifc.statement(1));
+                return null;
+            }
+
+            @Override
+            public Void visitWhileStmt(WhileStmtContext w) {
+                checkExpr(w.expression());
+                visit(w.statement());
+                return null;
+            }
+
+            @Override
+            public Void visitReturnStmt(ReturnStmtContext r) {
+                checkExpr(r.expression());
+                return null;
+            }
+
         }.visit(program);
-
-        System.out.println("wow");
-
-        grader.print("Variables:\n");
-
-        grader.print("\n");
-
-        grader.print("Functions:\n");
     }
 }
