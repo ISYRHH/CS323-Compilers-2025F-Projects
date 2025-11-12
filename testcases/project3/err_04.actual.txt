@@ -1,5 +1,1 @@
-line 3:7 mismatched input ';' expecting {'int', 'char', 'struct', ')'}
-Variables:
-a: int
-
-Functions:
+3:4: error: Redeclaration of 'a'

@@ -243,6 +243,9 @@ public class Compiler extends AbstractCompiler {
                             grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
                         }
                         // register function before processing body so recursive calls work
+                        if (global.containsHere(fname)) {
+                            grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
+                        }
                         global.define(fname, ft);
                         globalFuncs.putIfAbsent(fname, ft);
 
@@ -266,6 +269,26 @@ public class Compiler extends AbstractCompiler {
                             visit(s);
                         }
                         cur = old;
+                    }
+                    // function declaration? (specifier Identifier LPAREN funcArgs RPAREN SEMI)
+                    else if (g.funcArgs() != null && g.Identifier() != null && g.LBRACE() == null) {
+                        String fname = g.Identifier().getText();
+                        framework.lang.Type rett = typeFromSpecifier(g.specifier());
+                        Types.FuncType ft = new Types.FuncType(rett);
+                        FuncArgsContext fa = g.funcArgs();
+                        if (fa != null && fa.specifier().size() > 0) {
+                            for (int i = 0; i < fa.specifier().size(); i++) {
+                                framework.lang.Type pt = typeFromSpecifier(fa.specifier(i));
+                                VarDecl vd = resolveVarDec(fa.varDec(i), pt);
+                                ft.addParam(vd.type);
+                            }
+                        }
+                        // redeclaration checks: if already declared/defined in this scope -> error
+                        if (global.containsHere(fname)) {
+                            grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
+                        }
+                        global.define(fname, ft);
+                        globalFuncs.putIfAbsent(fname, ft);
                     } else if (g.varDec() != null) {
                         // global variable definition: specifier varDec SEMI
                         framework.lang.Type base = typeFromSpecifier(g.specifier());

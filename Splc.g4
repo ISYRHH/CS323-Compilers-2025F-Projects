@@ -17,6 +17,7 @@ program
 
 globalDef
     : specifier Identifier LPAREN funcArgs RPAREN LBRACE statement* RBRACE          // 函数定义
+    | specifier Identifier LPAREN funcArgs RPAREN SEMI                              // 函数声明 (新增)
     | specifier varDec SEMI     // 全局变量定义
     | specifier SEMI  // 全局结构体声明
     ;
