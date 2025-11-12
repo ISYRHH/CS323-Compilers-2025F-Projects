@@ -18,6 +18,7 @@ import java.util.Objects;
 
 import generated.Splc.SplcParser.*;
 import org.antlr.v4.runtime.tree.TerminalNode;
+import org.antlr.v4.runtime.tree.ParseTree;
 
 public class Compiler extends AbstractCompiler {
     public Compiler(AbstractGrader grader) {
@@ -99,7 +100,7 @@ public class Compiler extends AbstractCompiler {
                         if (resolved.type instanceof Types.StructType) {
                             Types.StructType memberStruct = (Types.StructType) resolved.type;
                             if (!memberStruct.isComplete()) {
-                                grader.reportSemanticError(Project3SemanticError.memberIncomplete(mv.Identifier()));
+                                grader.reportSemanticError(Project3SemanticError.memberIncomplete(resolved.idTok));
                             }
                         }
                         // duplicate member names not tracked across name spaces here; but check within struct
@@ -115,36 +116,72 @@ public class Compiler extends AbstractCompiler {
 
             private VarDecl resolveVarDec(VarDecContext ctx, framework.lang.Type base) {
                 Objects.requireNonNull(ctx);
-                // recursively resolve inner varDec first
-                if (ctx.Identifier() != null) {
-                    VarDecl r = new VarDecl();
-                    r.name = ctx.Identifier().getText();
-                    r.idTok = ctx.Identifier();
-                    r.type = base;
-                    return r;
-                }
-                if (ctx.LPAREN() != null) {
-                    VarDecl inner = resolveVarDec(ctx.varDec(), base);
-                    return inner;
-                }
-                if (ctx.STAR() != null) {
-                    VarDecl inner = resolveVarDec(ctx.varDec(), base);
-                    VarDecl r = new VarDecl();
-                    r.name = inner.name; r.idTok = inner.idTok; r.type = new Types.PointerType(inner.type);
-                    return r;
-                }
-                // array or recursion case
-                if (ctx.varDec() != null) {
-                    VarDecl inner = resolveVarDec(ctx.varDec(), base);
-                    if (ctx.Number() != null) {
-                        int len = Integer.parseInt(ctx.Number().getText());
-                        VarDecl r = new VarDecl();
-                        r.name = inner.name; r.idTok = inner.idTok; r.type = new Types.ArrayType(inner.type, len);
-                        return r;
+                // Find the Identifier terminal inside this declarator subtree
+                TerminalNode idTok = findIdentifier(ctx);
+                if (idTok == null) throw new RuntimeException("no identifier in varDec");
+
+                VarDecl r = new VarDecl();
+                r.name = idTok.getText();
+                r.idTok = idTok;
+
+                // collect operators encountered when walking up from the identifier to the
+                // top declarator context. We record them in the order encountered (inner->outer),
+                // then reverse to apply them in correct semantic order.
+                java.util.List<Object> ops = new java.util.ArrayList<>();
+                ParseTree node = idTok.getParent();
+                while (node != null) {
+                    if (node instanceof VarDecContext) {
+                        VarDecContext v = (VarDecContext) node;
+                        if (v.Number() != null) {
+                            ops.add(Integer.parseInt(v.Number().getText())); // array with length
+                        } else if (v.STAR() != null) {
+                            ops.add("STAR");
+                        }
                     }
-                    return inner;
+                    if (node == ctx) break;
+                    node = node.getParent();
                 }
-                throw new RuntimeException("unhandled varDec shape");
+
+                // apply ops in reverse (outermost last) to the base type
+                framework.lang.Type cur = base;
+                java.util.Collections.reverse(ops);
+                for (Object op : ops) {
+                    if (op instanceof String && ((String) op).equals("STAR")) {
+                        cur = new Types.PointerType(cur);
+                    } else if (op instanceof Integer) {
+                        cur = new Types.ArrayType(cur, (Integer) op);
+                    }
+                }
+
+                r.type = cur;
+                return r;
+            }
+
+            private TerminalNode findIdentifier(ParseTree p) {
+                if (p instanceof VarDecContext) {
+                    VarDecContext v = (VarDecContext) p;
+                    if (v.Identifier() != null) return v.Identifier();
+                }
+                for (int i = 0; i < p.getChildCount(); i++) {
+                    ParseTree c = p.getChild(i);
+                    TerminalNode found = findIdentifier(c);
+                    if (found != null) return found;
+                }
+                return null;
+            }
+
+            // helper: when applying a prefix pointer operator to a declarator-derived type,
+            // arrays bind tighter than pointer in the declarator grammar. That means when
+            // parsing yields STAR(varDec) where varDec produced an ArrayType(element, len),
+            // the correct semantic type is ArrayType(PointerType(element), len) (i.e. array of
+            // pointer-to-element), not PointerType(ArrayType(element,len)). This helper
+            // pushes the pointer constructor down into nested array element types.
+            private framework.lang.Type pushPointerInside(framework.lang.Type t) {
+                if (t instanceof Types.ArrayType) {
+                    Types.ArrayType at = (Types.ArrayType) t;
+                    return new Types.ArrayType(pushPointerInside(at.getElement()), at.getLen());
+                }
+                return new Types.PointerType(t);
             }
 
             private void checkExpr(ExpressionContext e) {
@@ -277,7 +314,7 @@ public class Compiler extends AbstractCompiler {
                                 if (mv.type instanceof Types.StructType) {
                                     Types.StructType memberStruct = (Types.StructType) mv.type;
                                     if (!memberStruct.isComplete()) {
-                                        grader.reportSemanticError(Project3SemanticError.memberIncomplete(vds.get(i).Identifier()));
+                                        grader.reportSemanticError(Project3SemanticError.memberIncomplete(mv.idTok));
                                     }
                                 }
                                 st.addMember(mv.name, mv.type);
