@@ -1,0 +1,12 @@
+struct b b1;
+struct b *ptr;
+
+int foo() {
+    struct b b2;
+    return 0;
+}
+
+struct b {
+    char b;
+    struct b *ptr;
+};

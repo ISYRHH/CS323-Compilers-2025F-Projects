@@ -1,0 +1,4 @@
+Variables:
+
+Functions:
+foo: int(int,char)

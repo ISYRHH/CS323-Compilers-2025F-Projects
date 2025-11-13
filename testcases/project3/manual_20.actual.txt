@@ -1,0 +1,1 @@
+5:13: error: Definition of incomplete type 'b2'

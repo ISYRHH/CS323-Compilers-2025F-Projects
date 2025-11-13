@@ -1,0 +1,8 @@
+int x;
+struct x {
+    int o;
+};
+
+int main() {
+    struct x a;
+}

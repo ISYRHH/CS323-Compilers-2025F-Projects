@@ -1,0 +1,4 @@
+Variables:
+a: struct A[10]*
+
+Functions:

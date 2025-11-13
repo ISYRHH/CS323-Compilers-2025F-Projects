@@ -1,0 +1,4 @@
+Variables:
+v3: struct a{struct b v2;}
+
+Functions:

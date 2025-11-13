@@ -1,0 +1,4 @@
+Variables:
+b1: struct b{char b;struct b* ptr;}
+
+Functions:

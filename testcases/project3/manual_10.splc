@@ -1,0 +1,6 @@
+struct c c0; // Error: definition of incomplete type
+int main() {
+    struct c {
+        int x;
+    }varc;
+}

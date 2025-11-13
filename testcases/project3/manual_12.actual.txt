@@ -1,0 +1,4 @@
+Variables:
+varb: struct b{int x;}
+
+Functions:

@@ -1,0 +1,7 @@
+int main(struct b varb,int c) {
+    
+}
+
+struct b {
+    int x;
+}b0;

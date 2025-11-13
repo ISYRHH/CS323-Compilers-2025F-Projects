@@ -1,0 +1,10 @@
+struct T {          // 'T' 在此可见，它属于 'tag' namespace
+    int T;          // 合法：此处的 'T' 属于 'member' namespace，它不与上述的 'struct T' 冲突
+};
+int Tx;             // 合法：此处的 'Tx' 属于 'other' namespace
+struct Tx;          // 合法：此处的 'Tx' 属于 'tag' namespace
+
+struct T {
+    int x;
+    int y;
+} a;                // Error: Redeclaration of 'T' (Fixed in v2)

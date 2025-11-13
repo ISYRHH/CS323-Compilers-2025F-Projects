@@ -1,0 +1,7 @@
+struct b b1; 
+struct b b2[3]; // Error: definition of incomplete type
+struct b *ptr; 
+struct b {
+    char b;
+    struct b *ptr;
+};

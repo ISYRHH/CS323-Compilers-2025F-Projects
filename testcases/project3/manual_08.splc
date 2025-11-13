@@ -1,0 +1,12 @@
+struct T {
+    int x;
+    int y;
+    struct c {
+        int x[12];
+        struct T *ptr;
+        struct T { // Error: Redeclaration of 'T'
+            int a;
+        } t0; // Fixed in v2
+    } t0;
+    int qwq;
+};

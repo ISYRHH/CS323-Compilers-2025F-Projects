@@ -1,0 +1,5 @@
+Variables:
+b0: struct b{int x;}
+
+Functions:
+main: int(struct b,int)

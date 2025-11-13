@@ -1,0 +1,2 @@
+int func() {} // definition is also a declaration
+int func(); // Error: Redeclaration of 'func'

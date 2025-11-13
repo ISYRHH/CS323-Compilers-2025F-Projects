@@ -1,0 +1,6 @@
+int y;
+int func() {
+    int x;
+    char z;
+}
+int y; // Error: redefinition of 'y'

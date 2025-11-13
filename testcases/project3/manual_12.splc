@@ -1,0 +1,8 @@
+struct b;
+struct a {
+    struct b *a;
+};
+
+struct b {
+    int x;
+}varb;

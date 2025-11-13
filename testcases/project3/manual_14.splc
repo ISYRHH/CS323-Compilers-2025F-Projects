@@ -1,0 +1,4 @@
+struct d {
+    int a;
+    char *a; // Error: Member 'a' is duplicate.
+};

@@ -1,0 +1,13 @@
+struct b; // declaration of structure 'b', but incomplete
+
+struct b {
+    int a;
+    char b;
+    struct b *ptr;
+}; // the first full structure content declaration.
+
+struct b {
+    int a;
+    char b;
+    struct b *ptr;
+} qwq; // Error: Redeclaration of 'b'

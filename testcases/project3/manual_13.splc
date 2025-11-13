@@ -1,0 +1,3 @@
+struct c {
+    struct c c0; // Error: Member 'c0' has incomplete type. (Fixed in v2)
+}; 

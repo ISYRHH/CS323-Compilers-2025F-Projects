@@ -46,6 +46,8 @@ public class Compiler extends AbstractCompiler {
 
             private Types.PrimitiveType INT = new Types.PrimitiveType("int");
             private Types.PrimitiveType CHAR = new Types.PrimitiveType("char");
+            // stack to track struct types currently being defined (to detect nested re-definitions)
+            private java.util.Deque<Types.StructType> definingStack = new java.util.ArrayDeque<>();
 
             private Types.StructType ensureTag(SplcParser.SpecifierContext spec) {
                 // spec: STRUCT Identifier [ ... ]
@@ -79,34 +81,48 @@ public class Compiler extends AbstractCompiler {
                 if (spec.STRUCT() != null && spec.LBRACE() != null) {
                     TerminalNode id = spec.Identifier();
                     String tag = id.getText();
-                    // if tag exists and is complete in same scope -> redeclaration error
+                    // lookup existing tag (could be forward-declared or already defined)
                     Types.StructType existing = cur.lookupTag(tag);
+                    // if the existing tag refers to a struct that is currently being defined in an
+                    // enclosing struct/member-list, then this is a redeclaration (you cannot
+                    // provide a second full-definition of the same tag while the first is being
+                    // defined). Report redeclaration.
+                    if (existing != null && definingStack.contains(existing)) {
+                        grader.reportSemanticError(Project3SemanticError.redeclaration(id));
+                    }
+                    // if tag exists and is complete in the same (current) scope -> redeclaration
                     if (existing != null && existing.isComplete() && cur.hasTagHere(tag)) {
                         grader.reportSemanticError(Project3SemanticError.redeclaration(id));
                     }
                     Types.StructType st = existing != null ? existing : new Types.StructType(tag);
                     // mark visible immediately per project note
                     cur.defineTag(tag, st);
-                    // fill members
-                    List<SpecifierContext> specs = spec.specifier();
-                    List<VarDecContext> vds = spec.varDec();
-                    for (int i = 0; i < specs.size(); i++) {
-                        SpecifierContext ms = specs.get(i);
-                        VarDecContext mv = vds.get(i);
-                        // resolve member type and name using a temporary context: use current scope for tags
-                        framework.lang.Type base = typeFromSpecifier(ms);
-                        VarDecl resolved = resolveVarDec(mv, base);
-                        // member cannot have incomplete type (except pointer)
-                        if (resolved.type instanceof Types.StructType) {
-                            Types.StructType memberStruct = (Types.StructType) resolved.type;
-                            if (!memberStruct.isComplete()) {
-                                grader.reportSemanticError(Project3SemanticError.memberIncomplete(resolved.idTok));
+                    // mark as currently being defined so nested checks can detect redefinitions
+                    definingStack.push(st);
+                    try {
+                        // fill members
+                        List<SpecifierContext> specs = spec.specifier();
+                        List<VarDecContext> vds = spec.varDec();
+                        for (int i = 0; i < specs.size(); i++) {
+                            SpecifierContext ms = specs.get(i);
+                            VarDecContext mv = vds.get(i);
+                            // resolve member type and name using a temporary context: use current scope for tags
+                            framework.lang.Type base = typeFromSpecifier(ms);
+                            VarDecl resolved = resolveVarDec(mv, base);
+                            // member cannot have incomplete type (except pointer)
+                            if (resolved.type instanceof Types.StructType) {
+                                Types.StructType memberStruct = (Types.StructType) resolved.type;
+                                if (!memberStruct.isComplete()) {
+                                    grader.reportSemanticError(Project3SemanticError.memberIncomplete(resolved.idTok));
+                                }
                             }
+                            // duplicate member names not tracked across name spaces here; but check within struct
+                            st.addMember(resolved.name, resolved.type);
                         }
-                        // duplicate member names not tracked across name spaces here; but check within struct
-                        st.addMember(resolved.name, resolved.type);
+                        st.setComplete(true);
+                    } finally {
+                        definingStack.pop();
                     }
-                    st.setComplete(true);
                     return st;
                 }
                 return null;
@@ -328,26 +344,35 @@ public class Compiler extends AbstractCompiler {
                             TerminalNode id = sc.Identifier();
                             String tag = id.getText();
                             Types.StructType existing = global.lookupTag(tag);
+                            if (existing != null && definingStack.contains(existing)) {
+                                grader.reportSemanticError(Project3SemanticError.redeclaration(id));
+                            }
                             if (existing != null && existing.isComplete() && global.hasTagHere(tag)) {
                                 grader.reportSemanticError(Project3SemanticError.redeclaration(id));
                             }
                             Types.StructType st = existing != null ? existing : new Types.StructType(tag);
                             global.defineTag(tag, st);
-                            // fill members
-                            List<SpecifierContext> specs = sc.specifier();
-                            List<VarDecContext> vds = sc.varDec();
-                            for (int i = 0; i < specs.size(); i++) {
-                                framework.lang.Type base = typeFromSpecifier(specs.get(i));
-                                VarDecl mv = resolveVarDec(vds.get(i), base);
-                                if (mv.type instanceof Types.StructType) {
-                                    Types.StructType memberStruct = (Types.StructType) mv.type;
-                                    if (!memberStruct.isComplete()) {
-                                        grader.reportSemanticError(Project3SemanticError.memberIncomplete(mv.idTok));
+                            // mark as being defined so nested checks can detect redefinitions
+                            definingStack.push(st);
+                            try {
+                                // fill members
+                                List<SpecifierContext> specs = sc.specifier();
+                                List<VarDecContext> vds = sc.varDec();
+                                for (int i = 0; i < specs.size(); i++) {
+                                    framework.lang.Type base = typeFromSpecifier(specs.get(i));
+                                    VarDecl mv = resolveVarDec(vds.get(i), base);
+                                    if (mv.type instanceof Types.StructType) {
+                                        Types.StructType memberStruct = (Types.StructType) mv.type;
+                                        if (!memberStruct.isComplete()) {
+                                            grader.reportSemanticError(Project3SemanticError.memberIncomplete(mv.idTok));
+                                        }
                                     }
+                                    st.addMember(mv.name, mv.type);
                                 }
-                                st.addMember(mv.name, mv.type);
+                                st.setComplete(true);
+                            } finally {
+                                definingStack.pop();
                             }
-                            st.setComplete(true);
                         } else if (sc.STRUCT() != null && sc.LBRACE() == null) {
                             // e.g., struct Tag; declare incomplete tag
                             TerminalNode id = sc.Identifier();

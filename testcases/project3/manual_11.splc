@@ -1,0 +1,8 @@
+struct b;
+struct a {
+    struct b a; // Error: Member 'a' has incomplete type.
+};
+
+struct b {
+    int x;
+}varb;

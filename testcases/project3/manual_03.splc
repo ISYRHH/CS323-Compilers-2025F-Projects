@@ -1,0 +1,5 @@
+int x;
+int func() {
+    int x;
+    char z;
+}

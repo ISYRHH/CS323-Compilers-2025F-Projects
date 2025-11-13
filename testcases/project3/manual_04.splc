@@ -1,0 +1,2 @@
+int z;
+int z() {} // Error: redefinition of 'z'
