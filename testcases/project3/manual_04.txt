@@ -1,1 +1,1 @@
-2:4: error: Redeclaration of 'z'
+2:4: error: Redefinition of 'z'

@@ -1,5 +1,1 @@
-Variables:
-c0: struct c{int x;}
-
-Functions:
-main: int()
+1:9: error: Definition of incomplete type 'c0'

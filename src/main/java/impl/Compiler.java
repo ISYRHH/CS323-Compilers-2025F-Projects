@@ -37,7 +37,9 @@ public class Compiler extends AbstractCompiler {
         // global scope
         Scope global = new Scope(null);
         // keep insertion order for printing
-        Map<String, framework.lang.Type> globalVars = new LinkedHashMap<>();
+    Map<String, framework.lang.Type> globalVars = new LinkedHashMap<>();
+    // store token for each global variable to allow reporting errors after full program processed
+    Map<String, TerminalNode> globalVarTokens = new LinkedHashMap<>();
         Map<String, framework.lang.Type> globalFuncs = new LinkedHashMap<>();
 
         // visitor to process program
@@ -81,21 +83,31 @@ public class Compiler extends AbstractCompiler {
                 if (spec.STRUCT() != null && spec.LBRACE() != null) {
                     TerminalNode id = spec.Identifier();
                     String tag = id.getText();
-                    // lookup existing tag (could be forward-declared or already defined)
+                    // lookup existing tag (could be forward-declared or already defined in an
+                    // enclosing scope). For a full definition in the current scope, we must
+                    // treat tags declared in outer scopes as distinct types (they do not
+                    // become completed by an inner-scope full definition). Only reuse an
+                    // existing tag object if it was declared in the current scope.
                     Types.StructType existing = cur.lookupTag(tag);
                     // if the existing tag refers to a struct that is currently being defined in an
-                    // enclosing struct/member-list, then this is a redeclaration (you cannot
-                    // provide a second full-definition of the same tag while the first is being
-                    // defined). Report redeclaration.
-                    if (existing != null && definingStack.contains(existing)) {
+                    // enclosing struct/member-list in the same scope, then this is a redeclaration.
+                    if (existing != null && definingStack.contains(existing) && cur.hasTagHere(tag)) {
                         grader.reportSemanticError(Project3SemanticError.redeclaration(id));
                     }
                     // if tag exists and is complete in the same (current) scope -> redeclaration
                     if (existing != null && existing.isComplete() && cur.hasTagHere(tag)) {
                         grader.reportSemanticError(Project3SemanticError.redeclaration(id));
                     }
-                    Types.StructType st = existing != null ? existing : new Types.StructType(tag);
-                    // mark visible immediately per project note
+                    Types.StructType st;
+                    if (existing != null && cur.hasTagHere(tag)) {
+                        // reuse tag declared in this same scope
+                        st = existing;
+                    } else {
+                        // either no tag visible, or tag only visible from outer scope -> create a
+                        // new struct type object for this (current-scope) definition
+                        st = new Types.StructType(tag);
+                    }
+                    // mark visible in current scope
                     cur.defineTag(tag, st);
                     // mark as currently being defined so nested checks can detect redefinitions
                     definingStack.push(st);
@@ -261,8 +273,8 @@ public class Compiler extends AbstractCompiler {
                                 // prefer the existing FuncType (so its parameter list is preserved)
                                 ft = (Types.FuncType) existing;
                             } else {
-                                // declared as non-function (e.g., variable) -> redeclaration
-                                grader.reportSemanticError(Project3SemanticError.redeclaration(g.Identifier()));
+                                // declared as non-function (e.g., variable) -> redefinition (two definitions in same scope)
+                                grader.reportSemanticError(Project3SemanticError.redefinition(g.Identifier()));
                             }
                         } else {
                             // register function before processing body so recursive calls work
@@ -335,6 +347,7 @@ public class Compiler extends AbstractCompiler {
                         }
                         global.define(name, vd.type);
                         globalVars.putIfAbsent(name, vd.type);
+                        globalVarTokens.putIfAbsent(name, vd.idTok);
                     } else {
                         // specifier SEMI : probably struct declaration or standalone specifier
                         SpecifierContext sc = g.specifier();
@@ -383,6 +396,30 @@ public class Compiler extends AbstractCompiler {
                             }
                         }
                     }
+                }
+
+                // after processing all, check global variables for incomplete-struct definitions
+                for (Map.Entry<String, framework.lang.Type> e : globalVars.entrySet()) {
+                    framework.lang.Type t = e.getValue();
+                    if (t instanceof Types.StructType) {
+                        Types.StructType st = (Types.StructType) t;
+                        if (!st.isComplete()) {
+                            // report using stored token
+                            TerminalNode tok = globalVarTokens.get(e.getKey());
+                            grader.reportSemanticError(Project3SemanticError.definitionIncomplete(tok));
+                        }
+                    }
+                    if (t instanceof Types.ArrayType) {
+                        Types.ArrayType at = (Types.ArrayType) t;
+                        if (at.getElement() instanceof Types.StructType) {
+                            Types.StructType st = (Types.StructType) at.getElement();
+                            if (!st.isComplete()) {
+                                TerminalNode tok = globalVarTokens.get(e.getKey());
+                                grader.reportSemanticError(Project3SemanticError.definitionIncomplete(tok));
+                            }
+                        }
+                    }
+
                 }
 
                 // after processing all, if no semantic error occurred, print results
