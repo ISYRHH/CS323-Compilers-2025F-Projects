@@ -89,6 +89,13 @@ public class Types {
 
         public void addMember(String name, Type type) { members.add(new Member(name, type)); }
 
+        public boolean hasMember(String name) {
+            for (Member m : members) {
+                if (m.name.equals(name)) return true;
+            }
+            return false;
+        }
+
         @Override
         public String prettyPrint() {
             return "struct " + tag;

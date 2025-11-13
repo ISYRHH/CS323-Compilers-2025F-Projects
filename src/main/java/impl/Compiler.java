@@ -128,7 +128,10 @@ public class Compiler extends AbstractCompiler {
                                     grader.reportSemanticError(Project3SemanticError.memberIncomplete(resolved.idTok));
                                 }
                             }
-                            // duplicate member names not tracked across name spaces here; but check within struct
+                            // duplicate member names not tracked across other name spaces here; but check within this struct
+                            if (st.hasMember(resolved.name)) {
+                                grader.reportSemanticError(Project3SemanticError.memberDuplicate(resolved.idTok));
+                            }
                             st.addMember(resolved.name, resolved.type);
                         }
                         st.setComplete(true);
@@ -379,6 +382,9 @@ public class Compiler extends AbstractCompiler {
                                         if (!memberStruct.isComplete()) {
                                             grader.reportSemanticError(Project3SemanticError.memberIncomplete(mv.idTok));
                                         }
+                                    }
+                                    if (st.hasMember(mv.name)) {
+                                        grader.reportSemanticError(Project3SemanticError.memberDuplicate(mv.idTok));
                                     }
                                     st.addMember(mv.name, mv.type);
                                 }
