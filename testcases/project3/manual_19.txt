@@ -1,4 +1,1 @@
-Variables:
-
-Functions:
-foo: int(int,char)
+1:20: error: Redefinition of 'a'

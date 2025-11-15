@@ -37,10 +37,12 @@ public class Compiler extends AbstractCompiler {
         // global scope
         Scope global = new Scope(null);
         // keep insertion order for printing
-    Map<String, framework.lang.Type> globalVars = new LinkedHashMap<>();
-    // store token for each global variable to allow reporting errors after full program processed
-    Map<String, TerminalNode> globalVarTokens = new LinkedHashMap<>();
+        Map<String, framework.lang.Type> globalVars = new LinkedHashMap<>();
+        // store token for each global variable to allow reporting errors after full program processed
+        Map<String, TerminalNode> globalVarTokens = new LinkedHashMap<>();
         Map<String, framework.lang.Type> globalFuncs = new LinkedHashMap<>();
+        // track which functions have been given a body (defined)
+        java.util.Set<String> definedFuncs = new java.util.HashSet<>();
 
         // visitor to process program
         new SplcBaseVisitor<Void>() {
@@ -272,6 +274,10 @@ public class Compiler extends AbstractCompiler {
                         if (global.containsHere(fname)) {
                             framework.lang.Type existing = global.lookup(fname);
                             if (existing instanceof Types.FuncType) {
+                                // if function already had a body in this scope -> redefinition
+                                if (definedFuncs.contains(fname)) {
+                                    grader.reportSemanticError(Project3SemanticError.redefinition(g.Identifier()));
+                                }
                                 // previously declared as function: accept declaration before definition
                                 // prefer the existing FuncType (so its parameter list is preserved)
                                 ft = (Types.FuncType) existing;
@@ -284,6 +290,8 @@ public class Compiler extends AbstractCompiler {
                             global.define(fname, ft);
                             globalFuncs.putIfAbsent(fname, ft);
                         }
+                        // mark as defined (has a body) so subsequent definitions are errors
+                        definedFuncs.add(fname);
 
                         // create new scope for function body
                         Scope old = cur;
@@ -313,9 +321,16 @@ public class Compiler extends AbstractCompiler {
                         Types.FuncType ft = new Types.FuncType(rett);
                         FuncArgsContext fa = g.funcArgs();
                         if (fa != null && fa.specifier().size() > 0) {
+                            // check duplicate parameter names in declaration
+                            java.util.Set<String> paramNames = new java.util.HashSet<>();
                             for (int i = 0; i < fa.specifier().size(); i++) {
                                 framework.lang.Type pt = typeFromSpecifier(fa.specifier(i));
                                 VarDecl vd = resolveVarDec(fa.varDec(i), pt);
+                                if (paramNames.contains(vd.name)) {
+                                    grader.reportSemanticError(Project3SemanticError.redefinition(vd.idTok));
+                                } else {
+                                    paramNames.add(vd.name);
+                                }
                                 ft.addParam(vd.type);
                             }
                         }
