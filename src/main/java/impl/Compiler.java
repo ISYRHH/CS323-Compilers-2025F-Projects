@@ -964,9 +964,6 @@ public class Compiler extends AbstractCompiler {
                                 }
                             }
                             if (baseIR == null) {
-                                if (!baseAddr.type().isPointer()) {
-                                    System.err.println("DEBUG: DOT fallback gep base not pointer. baseExpr=" + dc.expression().getText() + ", baseAddrType=" + baseAddr.type().llvmName());
-                                }
                                 return curRef[0].gep(baseAddr, IRType.pointer(), 0, IRValue.consti32(0), null);
                             } else {
                                 return curRef[0].gep(baseAddr, baseIR, 0, IRValue.consti32(0), null);
@@ -977,9 +974,6 @@ public class Compiler extends AbstractCompiler {
                         int idx = st.getMemberIndex(memberName);
                         Type mtype = st.getMemberType(memberName);
                         IRType elty = toIRType.apply(mtype != null ? mtype : new Types.PrimitiveType("int"));
-                        if (!baseAddr.type().isPointer()) {
-                            System.err.println("DEBUG: DOT gep base not pointer. baseExpr=" + dc.expression().getText() + ", baseAddrType=" + baseAddr.type().llvmName());
-                        }
                         return curRef[0].gep(baseAddr, elty, 0, IRValue.consti32(idx), null);
                     }
                     if (ctx instanceof ExprArrowContext) {
@@ -1063,9 +1057,6 @@ public class Compiler extends AbstractCompiler {
                                 }
                             }
                             if (baseIR == null) {
-                                if (!basePtr.type().isPointer()) {
-                                    System.err.println("DEBUG: ARROW fallback gep base not pointer. baseExpr=" + ac.expression().getText() + ", basePtrType=" + basePtr.type().llvmName());
-                                }
                                 return curRef[0].gep(basePtr, IRType.pointer(), 0, IRValue.consti32(0), null);
                             } else {
                                 return curRef[0].gep(basePtr, baseIR, 0, IRValue.consti32(0), null);
@@ -1075,9 +1066,6 @@ public class Compiler extends AbstractCompiler {
                         int idx = st.getMemberIndex(memberName);
                         Type mtype = st.getMemberType(memberName);
                         IRType elty = toIRType.apply(mtype != null ? mtype : new Types.PrimitiveType("int"));
-                        if (!basePtr.type().isPointer()) {
-                            System.err.println("DEBUG: ARROW gep base not pointer. baseExpr=" + ac.expression().getText() + ", basePtrType=" + basePtr.type().llvmName());
-                        }
                         return curRef[0].gep(basePtr, elty, 0, IRValue.consti32(idx), null);
                     }
                     if (ctx instanceof ExprIdContext) {
@@ -1162,7 +1150,7 @@ public class Compiler extends AbstractCompiler {
                                     String rname = (root instanceof ExprIdContext) ? ((ExprIdContext) root).Identifier().getText() : root.getText();
                                     String rtCls = rootType != null ? rootType.getClass().getName() : "null";
                                     String etCls = elemType != null ? elemType.getClass().getName() : "null";
-                                    System.err.println("DEBUG: array root=" + rname + ", rootType=" + (rootType != null ? rootType.prettyPrint() : "null") + " (" + rtCls + ")" + ", deducedElemType=" + (elemType != null ? elemType.prettyPrint() : "null") + " (" + etCls + ")");
+                                    // debug information removed
                             } catch (Exception ignore) {}
                         }
                         IRType eltyElem = toIRType.apply(elemType != null ? elemType : new Types.PrimitiveType("int"));
@@ -1177,7 +1165,7 @@ public class Compiler extends AbstractCompiler {
                             }
                         }
                         if (!gepBase.type().isPointer()) {
-                            System.err.println("DEBUG: genAddr array base not pointer. baseExpr=" + base.getText() + ", baseAddr=" + gepBase + ", type=" + gepBase.type().llvmName());
+                            // previously logged debug info removed
                         }
                         // decide whether the GEP should use a leading 0 (for arrays/structs)
                         // or be a single-index GEP (for pointer-to-element like int*).
