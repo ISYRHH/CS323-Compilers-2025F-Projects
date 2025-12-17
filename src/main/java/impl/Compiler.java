@@ -595,7 +595,16 @@ public class Compiler extends AbstractCompiler {
                     return IRType.array(base, at.getLen());
                 }
                 if (t instanceof Types.StructType) {
-                    return IRType.structure(((Types.StructType) t).getTag());
+                    Types.StructType st = (Types.StructType) t;
+                    // ensure structure definition is emitted in IR builder when available
+                    if (st.isComplete()) {
+                        try {
+                            java.util.List<IRType> elems = new java.util.ArrayList<>();
+                            for (Type mt : st.getMemberTypes()) elems.add(apply(mt));
+                            ir.defineStructure(st.getTag(), elems);
+                        } catch (RuntimeException ignore) {}
+                    }
+                    return IRType.structure(st.getTag());
                 }
                 return IRType.pointer();
             }
@@ -608,8 +617,16 @@ public class Compiler extends AbstractCompiler {
         }
 
         // declare functions from globalFuncs map
+        // But skip those which are defined in the program to avoid declare+define duplicates
+        // reuse `definedFuncs` declared earlier when scanning globals
+        for (GlobalDefContext g : program.globalDef()) {
+            if (g.LBRACE() != null && g.RBRACE() != null) {
+                definedFuncs.add(g.Identifier().getText());
+            }
+        }
         for (Map.Entry<String, Type> e : globalFuncs.entrySet()) {
             if (!(e.getValue() instanceof Types.FuncType)) continue;
+            if (definedFuncs.contains(e.getKey())) continue; // already have definition
             Types.FuncType ft = (Types.FuncType) e.getValue();
             List<Pair<String, IRType>> args = new ArrayList<>();
             for (int i = 0; i < ft.params.size(); i++) {
@@ -631,6 +648,68 @@ public class Compiler extends AbstractCompiler {
         };
 
         // For each function definition, create IR
+        // Local helpers to resolve types from parse nodes (mirror earlier semantic helpers)
+        java.util.function.Function<SpecifierContext, Type> typeFromSpecifierLocal = new java.util.function.Function<>() {
+            public Type apply(SpecifierContext spec) {
+                if (spec.INT() != null) return new Types.PrimitiveType("int");
+                if (spec.CHAR() != null) return new Types.PrimitiveType("char");
+                if (spec.STRUCT() != null && spec.LBRACE() == null) {
+                    TerminalNode id = spec.Identifier();
+                    String tag = id.getText();
+                    Types.StructType st = global.lookupTag(tag);
+                    if (st == null) { st = new Types.StructType(tag); global.defineTag(tag, st); }
+                    return st;
+                }
+                // For struct with brace (definition) and other complex cases, fallback to null
+                return null;
+            }
+        };
+
+        java.util.function.Function<ParseTree, String> findIdentLocal = new java.util.function.Function<>() {
+            public String apply(ParseTree p) {
+                if (p instanceof VarDecContext && ((VarDecContext)p).Identifier() != null) return ((VarDecContext)p).Identifier().getText();
+                for (int i=0;i<p.getChildCount();i++) {
+                    String f = apply(p.getChild(i)); if (f!=null) return f;
+                }
+                return null;
+            }
+        };
+
+        java.util.function.BiFunction<VarDecContext, Type, Type> resolveVarDecLocal = new java.util.function.BiFunction<>() {
+            public Type apply(VarDecContext ctx, Type base) {
+                // find identifier node
+                ParseTree node = ctx;
+                ParseTree idNode = null;
+                java.util.ArrayList<Object> ops = new java.util.ArrayList<>();
+                // traverse down to identifier
+                java.util.Deque<ParseTree> stack = new java.util.ArrayDeque<>();
+                stack.push(ctx);
+                while (!stack.isEmpty()) {
+                    ParseTree cur = stack.pop();
+                    if (cur instanceof VarDecContext && ((VarDecContext)cur).Identifier()!=null) { idNode = cur; break; }
+                    for (int i=0;i<cur.getChildCount();i++) stack.push(cur.getChild(i));
+                }
+                // collect ops by walking from idNode up to ctx
+                ParseTree p = idNode;
+                while (p != null) {
+                    if (p instanceof VarDecContext) {
+                        VarDecContext v = (VarDecContext) p;
+                        if (v.Number() != null) ops.add(Integer.parseInt(v.Number().getText()));
+                        else if (v.STAR() != null) ops.add("STAR");
+                    }
+                    if (p == ctx) break;
+                    p = p.getParent();
+                }
+                // build type
+                Type curT = base;
+                java.util.Collections.reverse(ops);
+                for (Object op: ops) {
+                    if (op instanceof String) curT = new Types.PointerType(curT);
+                    else curT = new Types.ArrayType(curT, (Integer)op);
+                }
+                return curT;
+            }
+        };
         for (GlobalDefContext g : program.globalDef()) {
             if (g.LBRACE() == null || g.RBRACE() == null) continue; // not a function def
             String fname = g.Identifier().getText();
@@ -652,11 +731,14 @@ public class Compiler extends AbstractCompiler {
             // maps for local types and addresses
             Map<String, Type> localTypes = new HashMap<>();
             Map<String, IRValue> localAddrs = new HashMap<>();
+            Map<String, IRType> localIRTypes = new HashMap<>();
 
             // populate params
             for (int i = 0; i < args.size(); i++) {
                 localTypes.put(args.get(i).a, ft.params.get(i));
                 localAddrs.put(args.get(i).a, fb.param(args.get(i).a));
+                // remember the IRType for the parameter
+                localIRTypes.put(args.get(i).a, args.get(i).b);
             }
 
             BasicBlockBuilder[] curRef = new BasicBlockBuilder[]{fb.rootBlock()};
@@ -706,11 +788,14 @@ public class Compiler extends AbstractCompiler {
                             }
                             IRType elty = toIRType.apply(pointee != null ? pointee : new Types.PrimitiveType("int"));
                             // l +/- r: for subtraction, if it's l - r, perform gep with negative index
-                            if (isPlus) return curRef[0].gep(l, elty, 0, r, null);
-                            else {
+                            if (isPlus) {
+                                if (elty.isArray() || elty.isStructure()) return curRef[0].gep(l, elty, 0, r, null);
+                                else return curRef[0].gep(l, elty, r, null);
+                            } else {
                                 // compute negated index: 0 - r
                                 IRValue neg = curRef[0].sub(IRValue.consti32(0), r, null);
-                                return curRef[0].gep(l, elty, 0, neg, null);
+                                if (elty.isArray() || elty.isStructure()) return curRef[0].gep(l, elty, 0, neg, null);
+                                else return curRef[0].gep(l, elty, neg, null);
                             }
                         }
                         if (r.type().isPointer() && l.type().isInteger()) {
@@ -724,8 +809,10 @@ public class Compiler extends AbstractCompiler {
                                 else if (t instanceof Types.ArrayType) pointee = ((Types.ArrayType) t).getElement();
                             }
                             IRType elty = toIRType.apply(pointee != null ? pointee : new Types.PrimitiveType("int"));
-                            if (isPlus) return curRef[0].gep(r, elty, 0, l, null);
-                            else {
+                            if (isPlus) {
+                                if (elty.isArray() || elty.isStructure()) return curRef[0].gep(r, elty, 0, l, null);
+                                else return curRef[0].gep(r, elty, l, null);
+                            } else {
                                 // l - r where r is pointer and l integer: not supported, fallback to default
                             }
                         }
@@ -743,6 +830,13 @@ public class Compiler extends AbstractCompiler {
                         ExprRelContext rc = (ExprRelContext) ctx;
                         IRValue l = genR(rc.expression(0));
                         IRValue r = genR(rc.expression(1));
+                        // allow pointer <cmp> 0 by converting integer 0 to a null pointer
+                        if (l.type().isPointer() && r.type().isInteger() && r.llvmName().equals("0")) {
+                            r = IRValue.constNull();
+                        }
+                        if (r.type().isPointer() && l.type().isInteger() && l.llvmName().equals("0")) {
+                            l = IRValue.constNull();
+                        }
                         int op = ((TerminalNode) rc.getChild(1)).getSymbol().getType();
                         LLVMIcmpPredicate pred = LLVMIcmpPredicate.Equals;
                         switch (op) {
@@ -816,7 +910,11 @@ public class Compiler extends AbstractCompiler {
                                 }
                             }
                             IRType lty = toIRType.apply(lt != null ? lt : new Types.PrimitiveType("int"));
-                            curRef[0].store(addr, lty, rval);
+                            IRValue storeVal = rval;
+                            if (lty.isPointer() && rval.type().isInteger() && rval.llvmName().equals("0")) {
+                                storeVal = IRValue.constNull();
+                            }
+                            curRef[0].store(addr, lty, storeVal);
                             return rval;
                         } else {
                             return rval;
@@ -842,11 +940,37 @@ public class Compiler extends AbstractCompiler {
                             if (bt == null) bt = globalVars.get(bn);
                         }
                         if (!(bt instanceof Types.StructType)) {
-                            // fallback: assume pointer and compute with member index 0
-                            if (!baseAddr.type().isPointer()) {
-                                System.err.println("DEBUG: DOT fallback gep base not pointer. baseExpr=" + dc.expression().getText() + ", baseAddrType=" + baseAddr.type().llvmName());
+                            // fallback: try to obtain a reasonable IRType for the base
+                            IRType baseIR = null;
+                            if (dc.expression() instanceof ExprIdContext) {
+                                String bn = ((ExprIdContext) dc.expression()).Identifier().getText();
+                                baseIR = localIRTypes.get(bn);
+                                // try to derive an IRType from source-level type if IRType is unavailable or unhelpful
+                                if ((baseIR == null || baseIR.typeEquals(IRType.pointer())) && localTypes.get(bn) != null) {
+                                    Type lt = localTypes.get(bn);
+                                    if (lt instanceof Types.PointerType && ((Types.PointerType) lt).getRef() instanceof Types.ArrayType) {
+                                        baseIR = toIRType.apply(((Types.PointerType) lt).getRef());
+                                    } else {
+                                        baseIR = toIRType.apply(lt);
+                                    }
+                                }
+                                if (baseIR == null && globalVars.get(bn) != null) {
+                                    Type gt = globalVars.get(bn);
+                                    if (gt instanceof Types.PointerType && ((Types.PointerType) gt).getRef() instanceof Types.ArrayType) {
+                                        baseIR = toIRType.apply(((Types.PointerType) gt).getRef());
+                                    } else {
+                                        baseIR = toIRType.apply(gt);
+                                    }
+                                }
                             }
-                            return curRef[0].gep(baseAddr, IRType.pointer(), 0, IRValue.consti32(0), null);
+                            if (baseIR == null) {
+                                if (!baseAddr.type().isPointer()) {
+                                    System.err.println("DEBUG: DOT fallback gep base not pointer. baseExpr=" + dc.expression().getText() + ", baseAddrType=" + baseAddr.type().llvmName());
+                                }
+                                return curRef[0].gep(baseAddr, IRType.pointer(), 0, IRValue.consti32(0), null);
+                            } else {
+                                return curRef[0].gep(baseAddr, baseIR, 0, IRValue.consti32(0), null);
+                            }
                         }
                         Types.StructType st = (Types.StructType) bt;
                         String memberName = dc.Identifier().getText();
@@ -911,10 +1035,41 @@ public class Compiler extends AbstractCompiler {
                             if (bt instanceof Types.PointerType) bt = ((Types.PointerType) bt).getRef();
                         }
                         if (!(bt instanceof Types.StructType)) {
-                            if (!basePtr.type().isPointer()) {
-                                System.err.println("DEBUG: ARROW fallback gep base not pointer. baseExpr=" + ac.expression().getText() + ", basePtrType=" + basePtr.type().llvmName());
+                            IRType baseIR = null;
+                            // try to use previously deduced element type for the base expression
+                            if (elemTypeForBase != null) {
+                                Type cand = elemTypeForBase;
+                                if (cand instanceof Types.PointerType) cand = ((Types.PointerType) cand).getRef();
+                                if (cand != null) baseIR = toIRType.apply(cand);
                             }
-                            return curRef[0].gep(basePtr, IRType.pointer(), 0, IRValue.consti32(0), null);
+                            if (baseIR == null && ac.expression() instanceof ExprIdContext) {
+                                String bn = ((ExprIdContext) ac.expression()).Identifier().getText();
+                                baseIR = localIRTypes.get(bn);
+                                if ((baseIR == null || baseIR.typeEquals(IRType.pointer())) && localTypes.get(bn) != null) {
+                                    Type lt = localTypes.get(bn);
+                                    if (lt instanceof Types.PointerType && ((Types.PointerType) lt).getRef() instanceof Types.ArrayType) {
+                                        baseIR = toIRType.apply(((Types.PointerType) lt).getRef());
+                                    } else {
+                                        baseIR = toIRType.apply(lt);
+                                    }
+                                }
+                                if (baseIR == null && globalVars.get(bn) != null) {
+                                    Type gt = globalVars.get(bn);
+                                    if (gt instanceof Types.PointerType && ((Types.PointerType) gt).getRef() instanceof Types.ArrayType) {
+                                        baseIR = toIRType.apply(((Types.PointerType) gt).getRef());
+                                    } else {
+                                        baseIR = toIRType.apply(gt);
+                                    }
+                                }
+                            }
+                            if (baseIR == null) {
+                                if (!basePtr.type().isPointer()) {
+                                    System.err.println("DEBUG: ARROW fallback gep base not pointer. baseExpr=" + ac.expression().getText() + ", basePtrType=" + basePtr.type().llvmName());
+                                }
+                                return curRef[0].gep(basePtr, IRType.pointer(), 0, IRValue.consti32(0), null);
+                            } else {
+                                return curRef[0].gep(basePtr, baseIR, 0, IRValue.consti32(0), null);
+                            }
                         }
                         Types.StructType st = (Types.StructType) bt;
                         int idx = st.getMemberIndex(memberName);
@@ -950,7 +1105,7 @@ public class Compiler extends AbstractCompiler {
                         Type elemType = null;
                         // collect index chain and find root base id
                         java.util.Deque<ExpressionContext> idxChain = new java.util.ArrayDeque<>();
-                        ExpressionContext root = base;
+                        ExpressionContext root = ac;
                         while (root instanceof ExprArrayContext) {
                             ExprArrayContext r = (ExprArrayContext) root;
                             idxChain.addFirst(r.expression(1));
@@ -961,8 +1116,33 @@ public class Compiler extends AbstractCompiler {
                             String bn = ((ExprIdContext) root).Identifier().getText();
                             rootType = localTypes.get(bn);
                             if (rootType == null) rootType = globalVars.get(bn);
+                        } else if (root instanceof ExprDotContext) {
+                            ExprDotContext dc = (ExprDotContext) root;
+                            // base.struct.member: find base type then member type
+                            if (dc.expression() instanceof ExprIdContext) {
+                                String bn = ((ExprIdContext) dc.expression()).Identifier().getText();
+                                Type bt = localTypes.get(bn);
+                                if (bt == null) bt = globalVars.get(bn);
+                                if (bt instanceof Types.StructType) {
+                                    Types.StructType st = (Types.StructType) bt;
+                                    rootType = st.getMemberType(dc.Identifier().getText());
+                                }
+                            }
+                        } else if (root instanceof ExprArrowContext) {
+                            ExprArrowContext arc = (ExprArrowContext) root;
+                            // pointer->member: find base pointer type then member type
+                            if (ac.expression() instanceof ExprIdContext) {
+                                String bn = ((ExprIdContext) ac.expression()).Identifier().getText();
+                                Type bt = localTypes.get(bn);
+                                if (bt == null) bt = globalVars.get(bn);
+                                if (bt instanceof Types.PointerType) bt = ((Types.PointerType) bt).getRef();
+                                if (bt instanceof Types.StructType) {
+                                    Types.StructType st = (Types.StructType) bt;
+                                    rootType = st.getMemberType(arc.Identifier().getText());
+                                }
+                            }
                         }
-                        if (rootType != null) {
+                            if (rootType != null) {
                             Type curT = rootType;
                             for (ExpressionContext ignored : idxChain) {
                                 if (curT instanceof Types.PointerType) {
@@ -979,17 +1159,43 @@ public class Compiler extends AbstractCompiler {
                             elemType = curT;
                             // debug: show root and deduced element type
                             try {
-                                String rname = (root instanceof ExprIdContext) ? ((ExprIdContext) root).Identifier().getText() : root.getText();
-                                System.err.println("DEBUG: array root=" + rname + ", rootType=" + (rootType != null ? rootType.prettyPrint() : "null") + ", deducedElemType=" + (elemType != null ? elemType.prettyPrint() : "null"));
+                                    String rname = (root instanceof ExprIdContext) ? ((ExprIdContext) root).Identifier().getText() : root.getText();
+                                    String rtCls = rootType != null ? rootType.getClass().getName() : "null";
+                                    String etCls = elemType != null ? elemType.getClass().getName() : "null";
+                                    System.err.println("DEBUG: array root=" + rname + ", rootType=" + (rootType != null ? rootType.prettyPrint() : "null") + " (" + rtCls + ")" + ", deducedElemType=" + (elemType != null ? elemType.prettyPrint() : "null") + " (" + etCls + ")");
                             } catch (Exception ignore) {}
                         }
-                        IRType elty = toIRType.apply(elemType != null ? elemType : new Types.PrimitiveType("int"));
-                        // debug: if baseAddr is not a pointer, print diagnostics
-                        if (!baseAddr.type().isPointer()) {
-                            System.err.println("DEBUG: genAddr array base not pointer. baseExpr=" + base.getText() + ", baseAddr=" + baseAddr + ", type=" + baseAddr.type().llvmName());
+                        IRType eltyElem = toIRType.apply(elemType != null ? elemType : new Types.PrimitiveType("int"));
+                        // If the base is a pointer-typed variable (stored in an alloca), load the pointer value
+                        IRValue gepBase = baseAddr;
+                        if (base instanceof ExprIdContext) {
+                            String bname = ((ExprIdContext) base).Identifier().getText();
+                            Type btype = localTypes.get(bname);
+                            if (btype == null) btype = globalVars.get(bname);
+                            if (btype instanceof Types.PointerType) {
+                                gepBase = curRef[0].load(baseAddr, IRType.pointer(), "ptr.tmp");
+                            }
                         }
-                        // use gep with 0 and index
-                        return curRef[0].gep(baseAddr, elty, 0, indexVal, null);
+                        if (!gepBase.type().isPointer()) {
+                            System.err.println("DEBUG: genAddr array base not pointer. baseExpr=" + base.getText() + ", baseAddr=" + gepBase + ", type=" + gepBase.type().llvmName());
+                        }
+                        // decide whether the GEP should use a leading 0 (for arrays/structs)
+                        // or be a single-index GEP (for pointer-to-element like int*).
+                        Type arrayPointee = null;
+                        if (rootType instanceof Types.ArrayType) {
+                            arrayPointee = rootType;
+                        } else if (rootType instanceof Types.PointerType) {
+                            Type ref = ((Types.PointerType) rootType).getRef();
+                            if (ref instanceof Types.ArrayType) arrayPointee = ref;
+                        }
+                        if (arrayPointee != null) {
+                            // pointer points to an array; use two-index GEP and pass the array type
+                            IRType eltyGep = toIRType.apply(arrayPointee);
+                            return curRef[0].gep(gepBase, eltyGep, 0, indexVal, null);
+                        } else {
+                            // pointer-to-element or unknown: single-index GEP with element type
+                            return curRef[0].gep(gepBase, eltyElem, indexVal, null);
+                        }
                     }
                     // fallback: evaluate and assume it's a pointer already
                     return genR(ctx);
@@ -1007,21 +1213,26 @@ public class Compiler extends AbstractCompiler {
                         if (((ExpressionStmtContext) st).expression() != null) eg.genR(((ExpressionStmtContext) st).expression());
                     } else if (st instanceof VarDecStmtContext) {
                         VarDecStmtContext v = (VarDecStmtContext) st;
-                        TerminalNode id = findIdent.apply(v.varDec());
-                        String name = id != null ? id.getText() : "_v" + localAddrs.size();
-                        Type t = new Types.PrimitiveType("int");
-                        localTypes.put(name, t);
-                        IRType irt = toIRType.apply(t);
-                        IRValue addr = fb.rootBlock().alloca(irt, name + ".addr");
-                        localAddrs.put(name, addr);
-                        if (v.ASSIGN() != null) {
-                            IRValue rv = eg.genR(v.expression());
-                            curRef[0].store(addr, irt, rv);
-                        }
+                            TerminalNode id = findIdent.apply(v.varDec());
+                            String name = id != null ? id.getText() : "_v" + localAddrs.size();
+                            Type t = resolveVarDecLocal.apply(v.varDec(), typeFromSpecifierLocal.apply(v.specifier()));
+                            localTypes.put(name, t);
+                            IRType irt = toIRType.apply(t);
+                            IRValue addr = fb.rootBlock().alloca(irt, name + ".addr");
+                            localAddrs.put(name, addr);
+                            localIRTypes.put(name, irt);
+                            if (v.ASSIGN() != null) {
+                                IRValue rv = eg.genR(v.expression());
+                                IRValue storeVal = rv;
+                                if (irt.isPointer() && rv.type().isInteger() && rv.llvmName().equals("0")) {
+                                    storeVal = IRValue.constNull();
+                                }
+                                curRef[0].store(addr, irt, storeVal);
+                            }
                     } else if (st instanceof IfStmtContext) {
                         IfStmtContext is = (IfStmtContext) st;
                         IRValue condv = eg.genR(is.expression());
-                        IRValue zero = IRValue.consti32(0);
+                        IRValue zero = condv.type().isPointer() ? IRValue.constNull() : IRValue.consti32(0);
                         IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
                         BasicBlockBuilder thenB = fb.newBasicBlock("then");
                         BasicBlockBuilder elseB = fb.newBasicBlock("else");
@@ -1042,7 +1253,7 @@ public class Compiler extends AbstractCompiler {
                         curRef[0].br(condB);
                         curRef[0] = condB;
                         IRValue condv = eg.genR(ws.expression());
-                        IRValue zero = IRValue.consti32(0);
+                        IRValue zero = condv.type().isPointer() ? IRValue.constNull() : IRValue.consti32(0);
                         IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
                         curRef[0].condBr(cond, bodyB, afterB);
                         curRef[0] = bodyB;
@@ -1071,15 +1282,20 @@ public class Compiler extends AbstractCompiler {
                     // determine name
                     TerminalNode id = findIdent.apply(v.varDec());
                     String name = id != null ? id.getText() : "_v" + localAddrs.size();
-                    // try to infer type from global/func: default to int
-                    Type t = new Types.PrimitiveType("int");
+                    // determine declared type from varDec
+                    Type t = resolveVarDecLocal.apply(v.varDec(), typeFromSpecifierLocal.apply(v.specifier()));
                     localTypes.put(name, t);
                     IRType irt = toIRType.apply(t);
                     IRValue addr = fb.rootBlock().alloca(irt, name + ".addr");
                     localAddrs.put(name, addr);
-                    if (v.ASSIGN() != null) {
+                    localIRTypes.put(name, irt);
+                        if (v.ASSIGN() != null) {
                         IRValue rv = eg.genR(v.expression());
-                            curRef[0].store(addr, irt, rv);
+                            IRValue storeVal = rv;
+                            if (irt.isPointer() && rv.type().isInteger() && rv.llvmName().equals("0")) {
+                                storeVal = IRValue.constNull();
+                            }
+                            curRef[0].store(addr, irt, storeVal);
                     }
                 } else if (s instanceof ExpressionStmtContext) {
                     ExpressionStmtContext es = (ExpressionStmtContext) s;
@@ -1087,7 +1303,7 @@ public class Compiler extends AbstractCompiler {
                 } else if (s instanceof IfStmtContext) {
                     IfStmtContext is = (IfStmtContext) s;
                     IRValue condv = eg.genR(is.expression());
-                    IRValue zero = IRValue.consti32(0);
+                    IRValue zero = condv.type().isPointer() ? IRValue.constNull() : IRValue.consti32(0);
                     IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
                     BasicBlockBuilder thenB = fb.newBasicBlock("then");
                     BasicBlockBuilder elseB = fb.newBasicBlock("else");
@@ -1110,7 +1326,7 @@ public class Compiler extends AbstractCompiler {
                     curRef[0].br(condB);
                     curRef[0] = condB;
                     IRValue condv = eg.genR(ws.expression());
-                    IRValue zero = IRValue.consti32(0);
+                    IRValue zero = condv.type().isPointer() ? IRValue.constNull() : IRValue.consti32(0);
                     IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
                     curRef[0].condBr(cond, bodyB, afterB);
                     curRef[0] = bodyB;

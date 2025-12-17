@@ -105,6 +105,12 @@ public class Types {
             return null;
         }
 
+            public java.util.List<Type> getMemberTypes() {
+                java.util.List<Type> out = new java.util.ArrayList<>();
+                for (Member m : members) out.add(m.type);
+                return out;
+            }
+
             public int getMemberIndex(String name) {
                 for (int i = 0; i < members.size(); i++) {
                     if (members.get(i).name.equals(name)) return i;
