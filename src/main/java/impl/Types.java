@@ -84,6 +84,8 @@ public class Types {
             this.tag = tag;
         }
 
+        public String getTag() { return this.tag; }
+
         public void setComplete(boolean c) { this.complete = c; }
         public boolean isComplete() { return complete; }
 

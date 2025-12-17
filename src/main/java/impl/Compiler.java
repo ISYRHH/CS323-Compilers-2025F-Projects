@@ -14,6 +14,13 @@ import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonTokenStream;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.antlr.v4.runtime.tree.TerminalNode;
+import org.antlr.v4.runtime.misc.Pair;
+import framework.llvm.IRBuilder;
+import framework.llvm.IRType;
+import framework.llvm.IRValue;
+import framework.llvm.FunctionBuilder;
+import framework.llvm.BasicBlockBuilder;
+import framework.llvm.LLVMIcmpPredicate;
 
 import java.io.IOException;
 import java.util.*;
@@ -570,5 +577,372 @@ public class Compiler extends AbstractCompiler {
                 return null;
             }
         }.visit(program);
+        // --- Begin IR generation for Project5 ---
+        IRBuilder ir = new IRBuilder();
+
+        // helper: convert framework Types to IRType
+        java.util.function.Function<Type, IRType> toIRType = new java.util.function.Function<>() {
+            public IRType apply(Type t) {
+                if (t == null) return IRType.pointer();
+                if (t instanceof Types.PrimitiveType) {
+                    if (((Types.PrimitiveType) t).prettyPrint().equals("int")) return IRType.int32();
+                    return IRType.int32();
+                }
+                if (t instanceof Types.PointerType) return IRType.pointer();
+                if (t instanceof Types.ArrayType) {
+                    Types.ArrayType at = (Types.ArrayType) t;
+                    IRType base = apply(at.getElement());
+                    return IRType.array(base, at.getLen());
+                }
+                if (t instanceof Types.StructType) {
+                    return IRType.structure(((Types.StructType) t).getTag());
+                }
+                return IRType.pointer();
+            }
+        };
+
+        // define global variables
+        for (Map.Entry<String, Type> e : globalVars.entrySet()) {
+            IRType irt = toIRType.apply(e.getValue());
+            ir.defineGlobalVar(e.getKey(), irt);
+        }
+
+        // declare functions from globalFuncs map
+        for (Map.Entry<String, Type> e : globalFuncs.entrySet()) {
+            if (!(e.getValue() instanceof Types.FuncType)) continue;
+            Types.FuncType ft = (Types.FuncType) e.getValue();
+            List<Pair<String, IRType>> args = new ArrayList<>();
+            for (int i = 0; i < ft.params.size(); i++) {
+                args.add(new Pair<>("p" + i, toIRType.apply(ft.params.get(i))));
+            }
+            ir.declareFunction(e.getKey(), toIRType.apply(ft.ret), args);
+        }
+
+        // utility to find identifier in VarDec parse node
+        java.util.function.Function<ParseTree, TerminalNode> findIdent = new java.util.function.Function<>() {
+            public TerminalNode apply(ParseTree p) {
+                if (p instanceof VarDecContext && ((VarDecContext) p).Identifier() != null) return ((VarDecContext) p).Identifier();
+                for (int i = 0; i < p.getChildCount(); i++) {
+                    TerminalNode f = apply(p.getChild(i));
+                    if (f != null) return f;
+                }
+                return null;
+            }
+        };
+
+        // For each function definition, create IR
+        for (GlobalDefContext g : program.globalDef()) {
+            if (g.LBRACE() == null || g.RBRACE() == null) continue; // not a function def
+            String fname = g.Identifier().getText();
+            Type ftype = globalFuncs.get(fname);
+            Types.FuncType ft = (Types.FuncType) ftype;
+
+            List<Pair<String, IRType>> args = new ArrayList<>();
+            FuncArgsContext fa = g.funcArgs();
+            if (fa != null && fa.specifier().size() > 0) {
+                for (int i = 0; i < fa.specifier().size(); i++) {
+                    TerminalNode id = findIdent.apply(fa.varDec(i));
+                    String nm = id != null ? id.getText() : ("p" + i);
+                    args.add(new Pair<>(nm, toIRType.apply(ft.params.get(i))));
+                }
+            }
+
+            FunctionBuilder fb = ir.defineFunction(fname, toIRType.apply(ft.ret), args);
+
+            // maps for local types and addresses
+            Map<String, Type> localTypes = new HashMap<>();
+            Map<String, IRValue> localAddrs = new HashMap<>();
+
+            // populate params
+            for (int i = 0; i < args.size(); i++) {
+                localTypes.put(args.get(i).a, ft.params.get(i));
+                localAddrs.put(args.get(i).a, fb.param(args.get(i).a));
+            }
+
+            BasicBlockBuilder[] curRef = new BasicBlockBuilder[]{fb.rootBlock()};
+
+            // small expression generator
+            class ExprGen {
+                IRValue genR(ExpressionContext ctx) {
+                    if (ctx instanceof ExprIntContext) {
+                        int v = Integer.parseInt(((ExprIntContext) ctx).Number().getText());
+                        return IRValue.consti32(v);
+                    }
+                    if (ctx instanceof ExprParensContext) return genR(((ExprParensContext) ctx).expression());
+                    if (ctx instanceof ExprIdContext) {
+                        IRValue addr = genAddr(ctx);
+                        Type t = localTypes.get(((ExprIdContext) ctx).Identifier().getText());
+                        if (t == null) t = globalVars.get(((ExprIdContext) ctx).Identifier().getText());
+                        IRType ty = toIRType.apply(t);
+                        return curRef[0].load(addr, ty, ((ExprIdContext) ctx).Identifier().getText() + ".val");
+                    }
+                    if (ctx instanceof ExprCallContext) {
+                        ExprCallContext cc = (ExprCallContext) ctx;
+                        String callee = cc.Identifier().getText();
+                        List<IRValue> argv = new ArrayList<>();
+                        List<ExpressionContext> es = cc.expression();
+                        if (es == null) es = new ArrayList<>();
+                        for (ExpressionContext e : es) argv.add(genR(e));
+                        Types.FuncType cft = (Types.FuncType) globalFuncs.get(callee);
+                        IRType ret = toIRType.apply(cft.ret);
+                        return curRef[0].call(ret, callee, argv, null);
+                    }
+                    if (ctx instanceof ExprAddSubContext) {
+                        IRValue l = genR(((ExprAddSubContext) ctx).expression(0));
+                        IRValue r = genR(((ExprAddSubContext) ctx).expression(1));
+                        if (((ExprAddSubContext) ctx).PLUS() != null) return curRef[0].add(l, r, null);
+                        else return curRef[0].sub(l, r, null);
+                    }
+                    if (ctx instanceof ExprMulDivModContext) {
+                        IRValue l = genR(((ExprMulDivModContext) ctx).expression(0));
+                        IRValue r = genR(((ExprMulDivModContext) ctx).expression(1));
+                        if (((ExprMulDivModContext) ctx).STAR() != null) return curRef[0].mul(l, r, null);
+                        if (((ExprMulDivModContext) ctx).DIV() != null) return curRef[0].div(l, r, null);
+                        return curRef[0].rem(l, r, null);
+                    }
+                    if (ctx instanceof ExprRelContext) {
+                        ExprRelContext rc = (ExprRelContext) ctx;
+                        IRValue l = genR(rc.expression(0));
+                        IRValue r = genR(rc.expression(1));
+                        int op = ((TerminalNode) rc.getChild(1)).getSymbol().getType();
+                        LLVMIcmpPredicate pred = LLVMIcmpPredicate.Equals;
+                        switch (op) {
+                            case EQ: pred = LLVMIcmpPredicate.Equals; break;
+                            case NEQ: pred = LLVMIcmpPredicate.NotEquals; break;
+                            case LT: pred = LLVMIcmpPredicate.SignedLT; break;
+                            case GT: pred = LLVMIcmpPredicate.SignedGT; break;
+                            case LE: pred = LLVMIcmpPredicate.SignedLE; break;
+                            case GE: pred = LLVMIcmpPredicate.SignedGE; break;
+                        }
+                        IRValue cmp = curRef[0].icmp(l, pred, r, null);
+                        return curRef[0].zext(cmp, IRType.int32(), null);
+                    }
+                    if (ctx instanceof ExprArrayContext) {
+                        // evaluate element value: compute address then load
+                        IRValue addr = genAddr(ctx);
+                        // try to determine element type
+                        ExprArrayContext ac = (ExprArrayContext) ctx;
+                        Type baseType = null;
+                        if (ac.expression(0) instanceof ExprIdContext) {
+                            String bn = ((ExprIdContext) ac.expression(0)).Identifier().getText();
+                            baseType = localTypes.get(bn);
+                            if (baseType == null) baseType = globalVars.get(bn);
+                            if (baseType instanceof Types.ArrayType) baseType = ((Types.ArrayType) baseType).getElement();
+                            else if (baseType instanceof Types.PointerType) baseType = ((Types.PointerType) baseType).getRef();
+                        }
+                        IRType elty = toIRType.apply(baseType != null ? baseType : new Types.PrimitiveType("int"));
+                        return curRef[0].load(addr, elty, "elm");
+                    }
+                    if (ctx instanceof ExprAssignContext) {
+                        ExpressionContext left = ((ExprAssignContext) ctx).expression(0);
+                        ExpressionContext right = ((ExprAssignContext) ctx).expression(1);
+                        IRValue rval = genR(right);
+                        if (left instanceof ExprIdContext || left instanceof ExprArrayContext) {
+                            IRValue addr = genAddr(left);
+                            // determine lhs type
+                            Type lt = null;
+                            if (left instanceof ExprIdContext) {
+                                lt = localTypes.get(((ExprIdContext) left).Identifier().getText());
+                                if (lt == null) lt = globalVars.get(((ExprIdContext) left).Identifier().getText());
+                            } else if (left instanceof ExprArrayContext) {
+                                ExprArrayContext ac = (ExprArrayContext) left;
+                                if (ac.expression(0) instanceof ExprIdContext) {
+                                    Type bt = localTypes.get(((ExprIdContext) ac.expression(0)).Identifier().getText());
+                                    if (bt == null) bt = globalVars.get(((ExprIdContext) ac.expression(0)).Identifier().getText());
+                                    if (bt instanceof Types.ArrayType) lt = ((Types.ArrayType) bt).getElement();
+                                    else if (bt instanceof Types.PointerType) lt = ((Types.PointerType) bt).getRef();
+                                }
+                            }
+                            IRType lty = toIRType.apply(lt != null ? lt : new Types.PrimitiveType("int"));
+                            curRef[0].store(addr, lty, rval);
+                            return rval;
+                        } else {
+                            return rval;
+                        }
+                    }
+
+                    // fallback: evaluate as 0
+                    return IRValue.consti32(0);
+                }
+
+                // generate address for lvalue expressions
+                IRValue genAddr(ExpressionContext ctx) {
+                    if (ctx instanceof ExprIdContext) {
+                        String name = ((ExprIdContext) ctx).Identifier().getText();
+                        IRValue addr = localAddrs.get(name);
+                        if (addr != null) return addr;
+                        return ir.global(name);
+                    }
+                    if (ctx instanceof ExprArrayContext) {
+                        ExprArrayContext ac = (ExprArrayContext) ctx;
+                        ExpressionContext base = ac.expression(0);
+                        ExpressionContext idx = ac.expression(1);
+                        // get base pointer
+                        IRValue baseAddr;
+                        if (base instanceof ExprIdContext) baseAddr = genAddr(base);
+                        else baseAddr = genR(base); // base expression yields pointer
+                        // index value
+                        IRValue indexVal = genR(idx);
+                        // determine element type
+                        Type bt = null;
+                        if (base instanceof ExprIdContext) {
+                            String bn = ((ExprIdContext) base).Identifier().getText();
+                            bt = localTypes.get(bn);
+                            if (bt == null) bt = globalVars.get(bn);
+                        }
+                        Type elemType = null;
+                        if (bt instanceof Types.ArrayType) elemType = ((Types.ArrayType) bt).getElement();
+                        else if (bt instanceof Types.PointerType) elemType = ((Types.PointerType) bt).getRef();
+                        IRType elty = toIRType.apply(elemType != null ? elemType : new Types.PrimitiveType("int"));
+                        // use gep with 0 and index
+                        return curRef[0].gep(baseAddr, elty, 0, indexVal, null);
+                    }
+                    // fallback: evaluate and assume it's a pointer already
+                    return genR(ctx);
+                }
+            }
+
+            ExprGen eg = new ExprGen();
+
+            // helper to visit nested statements with current generator
+            class StmtGen {
+                void visitStatement(StatementContext st) {
+                    if (st instanceof BlockStmtContext) {
+                        for (StatementContext ss : ((BlockStmtContext) st).statement()) visitStatement(ss);
+                    } else if (st instanceof ExpressionStmtContext) {
+                        if (((ExpressionStmtContext) st).expression() != null) eg.genR(((ExpressionStmtContext) st).expression());
+                    } else if (st instanceof VarDecStmtContext) {
+                        VarDecStmtContext v = (VarDecStmtContext) st;
+                        TerminalNode id = findIdent.apply(v.varDec());
+                        String name = id != null ? id.getText() : "_v" + localAddrs.size();
+                        Type t = new Types.PrimitiveType("int");
+                        localTypes.put(name, t);
+                        IRType irt = toIRType.apply(t);
+                        IRValue addr = fb.rootBlock().alloca(irt, name + ".addr");
+                        localAddrs.put(name, addr);
+                        if (v.ASSIGN() != null) {
+                            IRValue rv = eg.genR(v.expression());
+                            curRef[0].store(addr, irt, rv);
+                        }
+                    } else if (st instanceof IfStmtContext) {
+                        IfStmtContext is = (IfStmtContext) st;
+                        IRValue condv = eg.genR(is.expression());
+                        IRValue zero = IRValue.consti32(0);
+                        IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
+                        BasicBlockBuilder thenB = fb.newBasicBlock("then");
+                        BasicBlockBuilder elseB = fb.newBasicBlock("else");
+                        BasicBlockBuilder mergeB = fb.newBasicBlock("ifend");
+                        curRef[0].condBr(cond, thenB, elseB);
+                        curRef[0] = thenB;
+                        visitStatement(is.statement(0));
+                        if (!curRef[0].hasTerminated()) curRef[0].br(mergeB);
+                        curRef[0] = elseB;
+                        if (is.statement().size() > 1) visitStatement(is.statement(1));
+                        if (!curRef[0].hasTerminated()) curRef[0].br(mergeB);
+                        curRef[0] = mergeB;
+                    } else if (st instanceof WhileStmtContext) {
+                        WhileStmtContext ws = (WhileStmtContext) st;
+                        BasicBlockBuilder condB = fb.newBasicBlock("while.cond");
+                        BasicBlockBuilder bodyB = fb.newBasicBlock("while.body");
+                        BasicBlockBuilder afterB = fb.newBasicBlock("while.end");
+                        curRef[0].br(condB);
+                        curRef[0] = condB;
+                        IRValue condv = eg.genR(ws.expression());
+                        IRValue zero = IRValue.consti32(0);
+                        IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
+                        curRef[0].condBr(cond, bodyB, afterB);
+                        curRef[0] = bodyB;
+                        visitStatement(ws.statement());
+                        if (!curRef[0].hasTerminated()) curRef[0].br(condB);
+                        curRef[0] = afterB;
+                    } else if (st instanceof ReturnStmtContext) {
+                        ReturnStmtContext rs = (ReturnStmtContext) st;
+                        IRValue rv = eg.genR(rs.expression());
+                        curRef[0].ret(rv);
+                    } else {
+                        // fallback: expression
+                        if (st instanceof ExpressionStmtContext) {
+                            ExpressionStmtContext es = (ExpressionStmtContext) st;
+                            if (es.expression() != null) eg.genR(es.expression());
+                        }
+                    }
+                }
+            }
+            StmtGen stg = new StmtGen();
+
+            // walk statements
+            for (StatementContext s : g.statement()) {
+                if (s instanceof VarDecStmtContext) {
+                    VarDecStmtContext v = (VarDecStmtContext) s;
+                    // determine name
+                    TerminalNode id = findIdent.apply(v.varDec());
+                    String name = id != null ? id.getText() : "_v" + localAddrs.size();
+                    // try to infer type from global/func: default to int
+                    Type t = new Types.PrimitiveType("int");
+                    localTypes.put(name, t);
+                    IRType irt = toIRType.apply(t);
+                    IRValue addr = fb.rootBlock().alloca(irt, name + ".addr");
+                    localAddrs.put(name, addr);
+                    if (v.ASSIGN() != null) {
+                        IRValue rv = eg.genR(v.expression());
+                            curRef[0].store(addr, irt, rv);
+                    }
+                } else if (s instanceof ExpressionStmtContext) {
+                    ExpressionStmtContext es = (ExpressionStmtContext) s;
+                    if (es.expression() != null) eg.genR(es.expression());
+                } else if (s instanceof IfStmtContext) {
+                    IfStmtContext is = (IfStmtContext) s;
+                    IRValue condv = eg.genR(is.expression());
+                    IRValue zero = IRValue.consti32(0);
+                    IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
+                    BasicBlockBuilder thenB = fb.newBasicBlock("then");
+                    BasicBlockBuilder elseB = fb.newBasicBlock("else");
+                    BasicBlockBuilder mergeB = fb.newBasicBlock("ifend");
+                    curRef[0].condBr(cond, thenB, elseB);
+                    // then
+                    curRef[0] = thenB;
+                    stg.visitStatement(is.statement(0));
+                    if (!curRef[0].hasTerminated()) curRef[0].br(mergeB);
+                    // else
+                    curRef[0] = elseB;
+                    if (is.statement().size() > 1) stg.visitStatement(is.statement(1));
+                    if (!curRef[0].hasTerminated()) curRef[0].br(mergeB);
+                    curRef[0] = mergeB;
+                } else if (s instanceof WhileStmtContext) {
+                    WhileStmtContext ws = (WhileStmtContext) s;
+                    BasicBlockBuilder condB = fb.newBasicBlock("while.cond");
+                    BasicBlockBuilder bodyB = fb.newBasicBlock("while.body");
+                    BasicBlockBuilder afterB = fb.newBasicBlock("while.end");
+                    curRef[0].br(condB);
+                    curRef[0] = condB;
+                    IRValue condv = eg.genR(ws.expression());
+                    IRValue zero = IRValue.consti32(0);
+                    IRValue cond = curRef[0].icmp(condv, LLVMIcmpPredicate.NotEquals, zero, null);
+                    curRef[0].condBr(cond, bodyB, afterB);
+                    curRef[0] = bodyB;
+                    stg.visitStatement(ws.statement());
+                    if (!curRef[0].hasTerminated()) curRef[0].br(condB);
+                    curRef[0] = afterB;
+                } else if (s instanceof ReturnStmtContext) {
+                    ReturnStmtContext rs = (ReturnStmtContext) s;
+                    IRValue rv = eg.genR(rs.expression());
+                    curRef[0].ret(rv);
+                } else {
+                    // other statements: fallback
+                }
+            }
+
+            
+
+            // Ensure function has terminating return (assumption: functions always return)
+            if (!fb.rootBlock().hasTerminated()) {
+                // try to add a default return 0
+                fb.rootBlock().ret(IRValue.consti32(0));
+            }
+        }
+
+        // print the IR
+        grader.printIR(ir);
+        // --- End IR generation ---
     }
 }
