@@ -688,9 +688,48 @@ public class Compiler extends AbstractCompiler {
                         return curRef[0].call(ret, callee, argv, null);
                     }
                     if (ctx instanceof ExprAddSubContext) {
-                        IRValue l = genR(((ExprAddSubContext) ctx).expression(0));
-                        IRValue r = genR(((ExprAddSubContext) ctx).expression(1));
-                        if (((ExprAddSubContext) ctx).PLUS() != null) return curRef[0].add(l, r, null);
+                        ExpressionContext lctx = ((ExprAddSubContext) ctx).expression(0);
+                        ExpressionContext rctx = ((ExprAddSubContext) ctx).expression(1);
+                        IRValue l = genR(lctx);
+                        IRValue r = genR(rctx);
+                        boolean isPlus = ((ExprAddSubContext) ctx).PLUS() != null;
+                        // pointer arithmetic: pointer +/- integer -> gep
+                        if (l.type().isPointer() && r.type().isInteger()) {
+                            // try to deduce element type for the pointer operand from source types
+                            Type pointee = null;
+                            if (lctx instanceof ExprIdContext) {
+                                String bn = ((ExprIdContext) lctx).Identifier().getText();
+                                Type t = localTypes.get(bn);
+                                if (t == null) t = globalVars.get(bn);
+                                if (t instanceof Types.PointerType) pointee = ((Types.PointerType) t).getRef();
+                                else if (t instanceof Types.ArrayType) pointee = ((Types.ArrayType) t).getElement();
+                            }
+                            IRType elty = toIRType.apply(pointee != null ? pointee : new Types.PrimitiveType("int"));
+                            // l +/- r: for subtraction, if it's l - r, perform gep with negative index
+                            if (isPlus) return curRef[0].gep(l, elty, 0, r, null);
+                            else {
+                                // compute negated index: 0 - r
+                                IRValue neg = curRef[0].sub(IRValue.consti32(0), r, null);
+                                return curRef[0].gep(l, elty, 0, neg, null);
+                            }
+                        }
+                        if (r.type().isPointer() && l.type().isInteger()) {
+                            // integer + pointer -> pointer (commute)
+                            Type pointee = null;
+                            if (rctx instanceof ExprIdContext) {
+                                String bn = ((ExprIdContext) rctx).Identifier().getText();
+                                Type t = localTypes.get(bn);
+                                if (t == null) t = globalVars.get(bn);
+                                if (t instanceof Types.PointerType) pointee = ((Types.PointerType) t).getRef();
+                                else if (t instanceof Types.ArrayType) pointee = ((Types.ArrayType) t).getElement();
+                            }
+                            IRType elty = toIRType.apply(pointee != null ? pointee : new Types.PrimitiveType("int"));
+                            if (isPlus) return curRef[0].gep(r, elty, 0, l, null);
+                            else {
+                                // l - r where r is pointer and l integer: not supported, fallback to default
+                            }
+                        }
+                        if (isPlus) return curRef[0].add(l, r, null);
                         else return curRef[0].sub(l, r, null);
                     }
                     if (ctx instanceof ExprMulDivModContext) {
@@ -720,17 +759,40 @@ public class Compiler extends AbstractCompiler {
                     if (ctx instanceof ExprArrayContext) {
                         // evaluate element value: compute address then load
                         IRValue addr = genAddr(ctx);
-                        // try to determine element type
+                        // try to determine element type (handle nested array accesses)
                         ExprArrayContext ac = (ExprArrayContext) ctx;
-                        Type baseType = null;
-                        if (ac.expression(0) instanceof ExprIdContext) {
-                            String bn = ((ExprIdContext) ac.expression(0)).Identifier().getText();
-                            baseType = localTypes.get(bn);
-                            if (baseType == null) baseType = globalVars.get(bn);
-                            if (baseType instanceof Types.ArrayType) baseType = ((Types.ArrayType) baseType).getElement();
-                            else if (baseType instanceof Types.PointerType) baseType = ((Types.PointerType) baseType).getRef();
+                        // walk to root identifier and simulate indexing
+                        java.util.Deque<ExpressionContext> idxChain2 = new java.util.ArrayDeque<>();
+                        ExpressionContext root2 = ac;
+                        while (root2 instanceof ExprArrayContext) {
+                            ExprArrayContext r = (ExprArrayContext) root2;
+                            idxChain2.addFirst(r.expression(1));
+                            root2 = r.expression(0);
                         }
-                        IRType elty = toIRType.apply(baseType != null ? baseType : new Types.PrimitiveType("int"));
+                        Type rootType2 = null;
+                        if (root2 instanceof ExprIdContext) {
+                            String bn2 = ((ExprIdContext) root2).Identifier().getText();
+                            rootType2 = localTypes.get(bn2);
+                            if (rootType2 == null) rootType2 = globalVars.get(bn2);
+                        }
+                        Type elemType2 = null;
+                        if (rootType2 != null) {
+                            Type curT = rootType2;
+                            for (ExpressionContext ignored : idxChain2) {
+                                if (curT instanceof Types.PointerType) {
+                                    Type ref = ((Types.PointerType) curT).getRef();
+                                    if (ref instanceof Types.ArrayType) curT = ((Types.ArrayType) ref).getElement();
+                                    else curT = ref;
+                                } else if (curT instanceof Types.ArrayType) {
+                                    curT = ((Types.ArrayType) curT).getElement();
+                                } else {
+                                    curT = null;
+                                    break;
+                                }
+                            }
+                            elemType2 = curT;
+                        }
+                        IRType elty = toIRType.apply(elemType2 != null ? elemType2 : new Types.PrimitiveType("int"));
                         return curRef[0].load(addr, elty, "elm");
                     }
                     if (ctx instanceof ExprAssignContext) {
@@ -767,6 +829,102 @@ public class Compiler extends AbstractCompiler {
 
                 // generate address for lvalue expressions
                 IRValue genAddr(ExpressionContext ctx) {
+                    // handle struct member access (dot/arrow)
+                    if (ctx instanceof ExprDotContext) {
+                        ExprDotContext dc = (ExprDotContext) ctx;
+                        // address of base struct
+                        IRValue baseAddr = genAddr(dc.expression());
+                        // try to find struct type
+                        Type bt = null;
+                        if (dc.expression() instanceof ExprIdContext) {
+                            String bn = ((ExprIdContext) dc.expression()).Identifier().getText();
+                            bt = localTypes.get(bn);
+                            if (bt == null) bt = globalVars.get(bn);
+                        }
+                        if (!(bt instanceof Types.StructType)) {
+                            // fallback: assume pointer and compute with member index 0
+                            if (!baseAddr.type().isPointer()) {
+                                System.err.println("DEBUG: DOT fallback gep base not pointer. baseExpr=" + dc.expression().getText() + ", baseAddrType=" + baseAddr.type().llvmName());
+                            }
+                            return curRef[0].gep(baseAddr, IRType.pointer(), 0, IRValue.consti32(0), null);
+                        }
+                        Types.StructType st = (Types.StructType) bt;
+                        String memberName = dc.Identifier().getText();
+                        int idx = st.getMemberIndex(memberName);
+                        Type mtype = st.getMemberType(memberName);
+                        IRType elty = toIRType.apply(mtype != null ? mtype : new Types.PrimitiveType("int"));
+                        if (!baseAddr.type().isPointer()) {
+                            System.err.println("DEBUG: DOT gep base not pointer. baseExpr=" + dc.expression().getText() + ", baseAddrType=" + baseAddr.type().llvmName());
+                        }
+                        return curRef[0].gep(baseAddr, elty, 0, IRValue.consti32(idx), null);
+                    }
+                    if (ctx instanceof ExprArrowContext) {
+                        ExprArrowContext ac = (ExprArrowContext) ctx;
+                        // pointer expression on lhs: prefer the address and load if the
+                        // element type is itself a pointer. This avoids cases where
+                        // genR returned a struct value instead of a pointer.
+                        IRValue baseAddr = genAddr(ac.expression());
+                        // try to deduce element type of the array-like base expression
+                        Type elemTypeForBase = null;
+                        // if base is an array expression, walk to its root id
+                        ExpressionContext tmpRoot = ac.expression();
+                        java.util.Deque<ExpressionContext> idxsForBase = new java.util.ArrayDeque<>();
+                        while (tmpRoot instanceof ExprArrayContext) {
+                            ExprArrayContext r = (ExprArrayContext) tmpRoot;
+                            idxsForBase.addFirst(r.expression(1));
+                            tmpRoot = r.expression(0);
+                        }
+                        Type rootT = null;
+                        if (tmpRoot instanceof ExprIdContext) {
+                            String bn = ((ExprIdContext) tmpRoot).Identifier().getText();
+                            rootT = localTypes.get(bn);
+                            if (rootT == null) rootT = globalVars.get(bn);
+                        }
+                        if (rootT != null) {
+                            Type curT = rootT;
+                            for (ExpressionContext ignored : idxsForBase) {
+                                if (curT instanceof Types.PointerType) {
+                                    Type ref = ((Types.PointerType) curT).getRef();
+                                    if (ref instanceof Types.ArrayType) curT = ((Types.ArrayType) ref).getElement();
+                                    else curT = ref;
+                                } else if (curT instanceof Types.ArrayType) {
+                                    curT = ((Types.ArrayType) curT).getElement();
+                                } else { curT = null; break; }
+                            }
+                            elemTypeForBase = curT;
+                        }
+                        IRValue basePtr;
+                        if (elemTypeForBase instanceof Types.PointerType) {
+                            // addr points to a pointer value; load pointer
+                            basePtr = curRef[0].load(baseAddr, IRType.pointer(), "ptr.tmp");
+                        } else {
+                            // addr points to the struct value itself; use its address as pointer
+                            basePtr = baseAddr;
+                        }
+                        String memberName = ac.Identifier().getText();
+                        // try to resolve member index via type info if available
+                        Type bt = null;
+                        if (ac.expression() instanceof ExprIdContext) {
+                            String bn = ((ExprIdContext) ac.expression()).Identifier().getText();
+                            bt = localTypes.get(bn);
+                            if (bt == null) bt = globalVars.get(bn);
+                            if (bt instanceof Types.PointerType) bt = ((Types.PointerType) bt).getRef();
+                        }
+                        if (!(bt instanceof Types.StructType)) {
+                            if (!basePtr.type().isPointer()) {
+                                System.err.println("DEBUG: ARROW fallback gep base not pointer. baseExpr=" + ac.expression().getText() + ", basePtrType=" + basePtr.type().llvmName());
+                            }
+                            return curRef[0].gep(basePtr, IRType.pointer(), 0, IRValue.consti32(0), null);
+                        }
+                        Types.StructType st = (Types.StructType) bt;
+                        int idx = st.getMemberIndex(memberName);
+                        Type mtype = st.getMemberType(memberName);
+                        IRType elty = toIRType.apply(mtype != null ? mtype : new Types.PrimitiveType("int"));
+                        if (!basePtr.type().isPointer()) {
+                            System.err.println("DEBUG: ARROW gep base not pointer. baseExpr=" + ac.expression().getText() + ", basePtrType=" + basePtr.type().llvmName());
+                        }
+                        return curRef[0].gep(basePtr, elty, 0, IRValue.consti32(idx), null);
+                    }
                     if (ctx instanceof ExprIdContext) {
                         String name = ((ExprIdContext) ctx).Identifier().getText();
                         IRValue addr = localAddrs.get(name);
@@ -777,23 +935,59 @@ public class Compiler extends AbstractCompiler {
                         ExprArrayContext ac = (ExprArrayContext) ctx;
                         ExpressionContext base = ac.expression(0);
                         ExpressionContext idx = ac.expression(1);
-                        // get base pointer
+                        // get base pointer. For nested array accesses (e.g. a[i][j])
+                        // ensure we get an address (pointer) instead of a loaded value.
                         IRValue baseAddr;
-                        if (base instanceof ExprIdContext) baseAddr = genAddr(base);
-                        else baseAddr = genR(base); // base expression yields pointer
+                        if (base instanceof ExprIdContext || base instanceof ExprArrayContext || base instanceof ExprDotContext || base instanceof ExprArrowContext) {
+                            baseAddr = genAddr(base);
+                        } else {
+                            baseAddr = genR(base); // base expression yields pointer/value
+                        }
                         // index value
                         IRValue indexVal = genR(idx);
-                        // determine element type
-                        Type bt = null;
-                        if (base instanceof ExprIdContext) {
-                            String bn = ((ExprIdContext) base).Identifier().getText();
-                            bt = localTypes.get(bn);
-                            if (bt == null) bt = globalVars.get(bn);
-                        }
+                        // determine element type by walking to the root identifier and
+                        // simulating index operations from left-to-right.
                         Type elemType = null;
-                        if (bt instanceof Types.ArrayType) elemType = ((Types.ArrayType) bt).getElement();
-                        else if (bt instanceof Types.PointerType) elemType = ((Types.PointerType) bt).getRef();
+                        // collect index chain and find root base id
+                        java.util.Deque<ExpressionContext> idxChain = new java.util.ArrayDeque<>();
+                        ExpressionContext root = base;
+                        while (root instanceof ExprArrayContext) {
+                            ExprArrayContext r = (ExprArrayContext) root;
+                            idxChain.addFirst(r.expression(1));
+                            root = r.expression(0);
+                        }
+                        Type rootType = null;
+                        if (root instanceof ExprIdContext) {
+                            String bn = ((ExprIdContext) root).Identifier().getText();
+                            rootType = localTypes.get(bn);
+                            if (rootType == null) rootType = globalVars.get(bn);
+                        }
+                        if (rootType != null) {
+                            Type curT = rootType;
+                            for (ExpressionContext ignored : idxChain) {
+                                if (curT instanceof Types.PointerType) {
+                                    Type ref = ((Types.PointerType) curT).getRef();
+                                    if (ref instanceof Types.ArrayType) curT = ((Types.ArrayType) ref).getElement();
+                                    else curT = ref;
+                                } else if (curT instanceof Types.ArrayType) {
+                                    curT = ((Types.ArrayType) curT).getElement();
+                                } else {
+                                    curT = null;
+                                    break;
+                                }
+                            }
+                            elemType = curT;
+                            // debug: show root and deduced element type
+                            try {
+                                String rname = (root instanceof ExprIdContext) ? ((ExprIdContext) root).Identifier().getText() : root.getText();
+                                System.err.println("DEBUG: array root=" + rname + ", rootType=" + (rootType != null ? rootType.prettyPrint() : "null") + ", deducedElemType=" + (elemType != null ? elemType.prettyPrint() : "null"));
+                            } catch (Exception ignore) {}
+                        }
                         IRType elty = toIRType.apply(elemType != null ? elemType : new Types.PrimitiveType("int"));
+                        // debug: if baseAddr is not a pointer, print diagnostics
+                        if (!baseAddr.type().isPointer()) {
+                            System.err.println("DEBUG: genAddr array base not pointer. baseExpr=" + base.getText() + ", baseAddr=" + baseAddr + ", type=" + baseAddr.type().llvmName());
+                        }
                         // use gep with 0 and index
                         return curRef[0].gep(baseAddr, elty, 0, indexVal, null);
                     }

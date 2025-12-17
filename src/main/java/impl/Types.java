@@ -105,6 +105,13 @@ public class Types {
             return null;
         }
 
+            public int getMemberIndex(String name) {
+                for (int i = 0; i < members.size(); i++) {
+                    if (members.get(i).name.equals(name)) return i;
+                }
+                return -1;
+            }
+
         @Override
         public String prettyPrint() {
             return "struct " + tag;
