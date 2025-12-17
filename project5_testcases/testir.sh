@@ -15,8 +15,18 @@ make compileir || exit 1
 for test_dir in $(ls -d test[0-9]* 2>/dev/null | sort); do
 
     # 1. 动态查找所有的 .in 文件
-    # 使用 ls 获取所有 .in 文件并排序
-    mapfile -t test_files < <(ls "$test_dir"/*.in 2>/dev/null | sort)
+    # 在 macOS 自带的 Bash (通常是 3.2) 上没有 `mapfile`，因此使用兼容实现。
+    test_files=()
+    for f in "$test_dir"/*.in; do
+        [ -e "$f" ] || break
+        test_files+=("$f")
+    done
+
+    # 对文件名进行排序（如果有多个）
+    if [ ${#test_files[@]} -gt 1 ]; then
+        IFS=$'\n' test_files=( $(printf "%s\n" "${test_files[@]}" | sort) )
+        unset IFS
+    fi
 
     # 如果没有找到任何 .in 文件，跳过该目录
     if [ ${#test_files[@]} -eq 0 ]; then
@@ -67,7 +77,7 @@ for test_dir in $(ls -d test[0-9]* 2>/dev/null | sort); do
             # ASan 的错误信息直接输出到了屏幕(stderr)，这里不用cat
         else
             # 比较输出
-            diff_output=$(diff -u -Z "$expected_file" "$temp_output")
+            diff_output=$(diff -u --strip-trailing-cr "$expected_file" "$temp_output")
             if [ $? -eq 0 ]; then
                 echo -e "Case ${case_name}: ${GREEN}PASS${NC}"
                 # 测试通过后删除临时文件，保持目录整洁

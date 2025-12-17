@@ -84,8 +84,6 @@ public class Types {
             this.tag = tag;
         }
 
-        public String getTag() { return this.tag; }
-
         public void setComplete(boolean c) { this.complete = c; }
         public boolean isComplete() { return complete; }
 
@@ -104,19 +102,6 @@ public class Types {
             }
             return null;
         }
-
-            public java.util.List<Type> getMemberTypes() {
-                java.util.List<Type> out = new java.util.ArrayList<>();
-                for (Member m : members) out.add(m.type);
-                return out;
-            }
-
-            public int getMemberIndex(String name) {
-                for (int i = 0; i < members.size(); i++) {
-                    if (members.get(i).name.equals(name)) return i;
-                }
-                return -1;
-            }
 
         @Override
         public String prettyPrint() {
@@ -143,6 +128,8 @@ public class Types {
                 this.type = type;
             }
         }
+        public String getTag() { return tag; }
+        public List<Member> getMembers() { return members; }
     }
     public static boolean isEqual(Type a, Type b) {
         if (a == null || b == null) return false;

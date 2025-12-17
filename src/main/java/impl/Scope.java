@@ -38,4 +38,6 @@ public class Scope {
     public void defineTag(String tag, Types.StructType s) { tags.put(tag, s); }
 
     public boolean hasTagHere(String tag) { return tags.containsKey(tag); }
+
+    public Map<String, Types.StructType> getTags() { return tags; }
 }
